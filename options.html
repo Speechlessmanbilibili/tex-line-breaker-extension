@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>TeX Line Breaker 设置</title>
+  <link rel="stylesheet" href="options.css">
+</head>
+<body>
+  <main class="page">
+    <header>
+      <div><h1>TeX Line Breaker</h1><p>使用 Rust/WASM Knuth–Plass 引擎重新排版安全的普通段落。</p></div>
+      <label class="switch-line"><span>全局启用</span><input id="globalEnabled" type="checkbox"></label>
+    </header>
+
+    <section>
+      <h2>站点规则</h2>
+      <p>站点规则优先于全局开关。域名会同时匹配其子域名。</p>
+      <div id="siteRules" class="site-rules"></div>
+      <button id="addSite" type="button" class="secondary">添加站点</button>
+    </section>
+
+    <section>
+      <h2>TeX/KP 参数</h2>
+      <div class="grid">
+        <label>预容差<input id="pretolerance" type="number" min="0" max="10" step="0.25"></label>
+        <label>容差<input id="tolerance" type="number" min="1" max="10" step="0.25"></label>
+        <label>紧急伸缩/em<input id="emergencyStretch" type="number" min="0" max="1" step="0.01"></label>
+        <label>最大拉伸比例<input id="maxStretch" type="number" min="0" max="1" step="0.01"></label>
+        <label>最大压缩比例<input id="maxShrink" type="number" min="0" max="1" step="0.01"></label>
+        <label>基础行罚值<input id="linePenalty" type="number" min="0" max="100" step="1"></label>
+        <label>相邻行适配度罚值<input id="fitnessDemerits" type="number" min="0" max="50000" step="100"></label>
+        <label>连续断词罚值<input id="doubleHyphenDemerits" type="number" min="0" max="50000" step="100"></label>
+        <label>倒数第二行断词罚值<input id="finalHyphenDemerits" type="number" min="0" max="50000" step="100"></label>
+        <label>过短末行罚值<input id="shortLastLinePenalty" type="number" min="0" max="50000" step="100"></label>
+        <label>末行孤字罚值<input id="orphanPenalty" type="number" min="0" max="50000" step="100"></label>
+      </div>
+      <label class="check"><input id="cjkRules" type="checkbox">中文标点禁则</label>
+      <label class="check"><input id="punctuationCompression" type="checkbox">CJK 标点挤压/连续标点压缩</label>
+      <label class="check"><input id="hangingPunctuation" type="checkbox">行首/行末悬挂标点</label>
+      <label class="check"><input id="hyphenation" type="checkbox">英文 TeX pattern 断词</label>
+      <p class="note">引擎依次执行预容差、允许断词的正常容差、紧急伸缩三遍求解；仅在前一遍无可行方案时进入下一遍。</p>
+      <p class="note">Auto Spacing 使用单一来源：检测到页面或其他扩展已启用 <code>text-autospace</code> 时直接沿用；否则由本扩展启用；浏览器不支持时才使用内部中英间距补偿，绝不叠加。</p>
+    </section>
+
+    <footer><span id="status"></span><button id="reset" class="secondary" type="button">恢复默认</button><button id="save" type="button">保存</button></footer>
+  </main>
+  <script src="shared.js"></script>
+  <script src="options.js"></script>
+</body>
+</html>
