@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "TeX Line Breaker",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtgTGUKoce9ZZx5039pS523Tz8cQQwdu8mK6hf62piG3cGESFhN3PPm76sJgXu/4bFEd3mO0rQKXqJYCnX04mLPzHvGkAXYURR6Ey6KIHPAD+7LfEcUlnxSKzQt/xti6+ljxONhY2Cu8jA33iJC1zDk4tsomdXs2TIG08CQjh/sRZo1wX3oluSZsr02LAAcXusU3O/mURWU2jLmJIcgKAwkAqIMrfMk92/Zm1LyruzgBjR5o3ckmMffa6ROetgzXLusXSKAKMHB7JODDr1ZDIGrIK1f6BuYaI8enmguJwmJuKLMNp0K4PDvOXQp9uPVtdTSaMTe4QGblxF5HnqUGtwQIDAQAB",
   "description": "TeX/Knuth-Plass paragraph line breaking with CJK microtypography for Chromium.",
   "content_security_policy": { "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'" },

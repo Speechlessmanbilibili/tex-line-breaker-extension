@@ -46,6 +46,15 @@ test("expanded CJK prohibition keeps small kana and closing punctuation off line
   assert.equal(kana[0].canBreakAfter, false);
 });
 
+test("forced breaks take precedence over CJK line-start prohibition", () => {
+  const tokens = shared.applyBreakRules([
+    { text: "", type: "newline", forcedBreakAfter: true },
+    { text: "。", type: "punct" }
+  ], true);
+  assert.equal(tokens[0].canBreakAfter, true);
+  assert.equal(tokens[0].forcedBreakAfter, true);
+});
+
 test("punctuation profile exposes compression and optical protrusion", () => {
   const profile = shared.punctuationProfile({ text: "。", type: "punct" }, 20, true);
   assert.equal(profile.shrink, 5);

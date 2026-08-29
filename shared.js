@@ -99,7 +99,7 @@
       else if (token.text === "\u00ad") { canBreakAfter = true; penalty = 50; flagged = true; insert = "-"; }
       else if (token.text === "-" || token.text === "‐") { canBreakAfter = true; penalty = 50; flagged = true; }
       else if (token.type === "cjk" || next.type === "cjk") canBreakAfter = true;
-      if (cjkRules && (NON_ENDING.has(token.text.at(-1)) || NON_STARTING.has(next?.text?.at(0)))) {
+      if (!forcedBreakAfter && cjkRules && (NON_ENDING.has(token.text.at(-1)) || NON_STARTING.has(next?.text?.at(0)))) {
         canBreakAfter = false;
         penalty = 10_000;
       }
