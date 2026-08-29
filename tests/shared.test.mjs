@@ -82,7 +82,7 @@ test("forced breaks take precedence over CJK line-start prohibition", () => {
   assert.equal(tokens[0].forcedBreakAfter, true);
 });
 
-test("punctuation profile exposes compression and optical protrusion", () => {
+test("punctuation profile exposes font-aware compression and optical protrusion", () => {
   const profile = shared.punctuationProfile({ text: "。", type: "punct" }, 20, true, true);
   assert.equal(profile.shrink, 10);
   assert.equal(profile.beforeShrink, 10);
@@ -91,18 +91,21 @@ test("punctuation profile exposes compression and optical protrusion", () => {
   const opening = shared.punctuationProfile({ text: "（", type: "punct" }, 20, true, true);
   assert.equal(opening.beforeShrink, 0);
   assert.equal(opening.afterShrink, 5);
+  const measured = shared.punctuationProfile({ text: "。", type: "punct" }, 20, true, true, { advance: 20, leftBearing: 13, rightBearing: 18 });
+  assert.equal(measured.beforeShrink, 13);
+  assert.equal(measured.endProtrusion, 7);
 });
 
 test("hanging punctuation is independent from punctuation compression", () => {
   const profile = shared.punctuationProfile({ text: "，", type: "punct" }, 16, false, true);
   assert.equal(profile.shrink, 0);
-  assert.equal(profile.endProtrusion, 8);
+  assert.equal(profile.endProtrusion, 13.6);
 });
 
-test("token spacing uses selectable padding for expansion and margin for compression", () => {
-  assert.deepEqual(shared.tokenSpacingStyle(2, 1), { paddingInlineEnd: 3, marginInlineEnd: 0 });
-  assert.deepEqual(shared.tokenSpacingStyle(-2, 0), { paddingInlineEnd: 0, marginInlineEnd: -2 });
-  assert.deepEqual(shared.tokenSpacingStyle(0, 0), { paddingInlineEnd: 0, marginInlineEnd: 0 });
+test("token spacing uses selectable letter spacing for both directions", () => {
+  assert.deepEqual(shared.tokenSpacingStyle(2, 1), { letterSpacing: 3 });
+  assert.deepEqual(shared.tokenSpacingStyle(-2, 0), { letterSpacing: -2 });
+  assert.deepEqual(shared.tokenSpacingStyle(0, 0), { letterSpacing: 0 });
 });
 
 test("ordinary CJK glyphs never expose shrink capacity", () => {
@@ -112,7 +115,7 @@ test("ordinary CJK glyphs never expose shrink capacity", () => {
 });
 
 test("a legal hanging punctuation break receives priority", () => {
-  assert.equal(shared.hangingBreakPenalty(0, 8, true), -50);
+  assert.equal(shared.hangingBreakPenalty(0, 8, true), -180);
   assert.equal(shared.hangingBreakPenalty(0, 0, true), 0);
   assert.equal(shared.hangingBreakPenalty(25, 8, false), 25);
 });

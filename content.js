@@ -14,12 +14,38 @@
   const overflowOverrides = new Map();
   let settings = { ...DEFAULTS };
   let wasm = null;
+  let startupError = "";
   let observer = null;
   let resizeObserver = null;
   let muting = false;
   let scanTimer = 0;
   const pendingRoots = new Set();
   const hyphenateEnglish = createPatternHyphenator(globalThis.TexLineBreakerHyphenationEnUs);
+
+  document.documentElement.dataset.kpExtensionState = "loading";
+
+  chrome.runtime.onMessage.addListener(message => {
+    if (message?.type === "kp-status") {
+      return Promise.resolve({
+        ok: Boolean(wasm),
+        state: wasm ? "ready" : startupError ? "error" : "loading",
+        error: startupError,
+        enabled: effectiveEnabled(settings, location.hostname),
+        rendered: rendered.size
+      });
+    }
+    if (message?.type === "kp-rerender") {
+      if (!wasm) return Promise.resolve({ ok: false, error: startupError || "排版核心仍在加载" });
+      restoreAll();
+      scheduleScan(document);
+      return Promise.resolve({ ok: true });
+    }
+    if (message?.type === "kp-restore") {
+      restoreAll();
+      return Promise.resolve({ ok: true });
+    }
+    return false;
+  });
 
   async function loadWasm() {
     const url = chrome.runtime.getURL("wasm/tex_line_breaker_core.wasm");
@@ -89,6 +115,7 @@
     if (cs.display === "flex" || cs.display === "grid" || cs.display === "inline-flex" || cs.display === "inline-grid") return false;
     if (cs.whiteSpace.includes("nowrap") || cs.writingMode !== "horizontal-tb") return false;
     if (cs.direction === "rtl") return false;
+    if (!new Set(["start", "left", "justify"]).has(cs.textAlign)) return false;
     if (Number.parseFloat(cs.textIndent) < 0) return false;
     if (el.clientWidth < 80) return false;
     if (el.tagName === "DIV" && el.children.length > 0 && Array.from(el.children).some(child => !INLINE_TAGS.has(child.tagName))) return false;
@@ -217,7 +244,14 @@
     const em = Number.parseFloat(rootStyle.fontSize) || 16;
     const syntheticSpacing = em * 0.125;
     const hyphenWidth = measureInsertedGlyph(root, "-");
-    const profiles = tokens.map(token => punctuationProfile(token, em, settings.punctuationCompression, settings.hangingPunctuation));
+    const measurePunctuation = createPunctuationMeasurer(root);
+    const profiles = tokens.map((token, index) => punctuationProfile(
+      token,
+      em,
+      settings.punctuationCompression,
+      settings.hangingPunctuation,
+      measurePunctuation(token, widths[index])
+    ));
     return widths.map((width, index) => {
       const token = tokens[index];
       const punctuation = profiles[index];
@@ -259,6 +293,34 @@
     finally { span.remove(); muting = false; }
   }
 
+  function createPunctuationMeasurer(root) {
+    const context = document.createElement("canvas").getContext("2d");
+    const cache = new Map();
+    return (token, advance) => {
+      if (!context || token?.type !== "punct" || !token.text) return {};
+      const owner = token.sourceNode?.parentElement || root;
+      const style = getComputedStyle(owner);
+      const font = style.font || `${style.fontStyle} ${style.fontWeight} ${style.fontSize} ${style.fontFamily}`;
+      const key = `${font}\u0000${style.fontKerning}\u0000${token.text}`;
+      let ink = cache.get(key);
+      if (!ink) {
+        context.font = font;
+        context.direction = style.direction === "rtl" ? "rtl" : "ltr";
+        if ("fontKerning" in context) context.fontKerning = style.fontKerning;
+        if ("fontStretch" in context) context.fontStretch = style.fontStretch;
+        const metrics = context.measureText(token.text);
+        const measuredAdvance = Number(metrics.width) || advance;
+        ink = {
+          measuredAdvance,
+          leftBearing: Number.isFinite(metrics.actualBoundingBoxLeft) ? Math.max(0, -metrics.actualBoundingBoxLeft) : 0,
+          rightBearing: Number.isFinite(metrics.actualBoundingBoxRight) ? Math.max(0, measuredAdvance - metrics.actualBoundingBoxRight) : 0
+        };
+        cache.set(key, ink);
+      }
+      return { advance: Math.max(advance, ink.measuredAdvance), leftBearing: ink.leftBearing, rightBearing: ink.rightBearing };
+    };
+  }
+
   function appendToken(lineEl, token, state) {
     if (token.type === "newline") return null;
     const visibleText = token.text === "\u00ad" ? "" : token.text;
@@ -284,8 +346,18 @@
   function applyTokenSpacing(tokenEl, adjustment, autoSpace) {
     if (!tokenEl) return;
     const spacing = tokenSpacingStyle(adjustment, autoSpace);
-    if (spacing.paddingInlineEnd) tokenEl.style.paddingInlineEnd = `${spacing.paddingInlineEnd}px`;
-    if (spacing.marginInlineEnd) tokenEl.style.marginInlineEnd = `${spacing.marginInlineEnd}px`;
+    if (!spacing.letterSpacing) return;
+    const textNode = Array.from(tokenEl.childNodes).find(node => node.nodeType === Node.TEXT_NODE && node.nodeValue);
+    if (!textNode) return;
+    const characters = Array.from(textNode.nodeValue);
+    const finalCharacter = characters.pop();
+    if (!finalCharacter) return;
+    const boundary = document.createElement("span");
+    boundary.dataset.kpLetterSpacing = "1";
+    boundary.style.letterSpacing = `${spacing.letterSpacing}px`;
+    boundary.textContent = finalCharacter;
+    if (characters.length) textNode.replaceWith(document.createTextNode(characters.join("")), boundary);
+    else textNode.replaceWith(boundary);
   }
 
   function restoreInlineProperty(element, property, value, priority) {
@@ -372,6 +444,7 @@
   }
 
   function cleanGeneratedContent(root) {
+    for (const boundary of Array.from(root.querySelectorAll("[data-kp-letter-spacing]")).reverse()) boundary.replaceWith(...Array.from(boundary.childNodes));
     for (const generated of root.querySelectorAll("[data-kp-adjustment], [data-kp-autospace-spacer], [data-kp-discretionary], [data-kp-placeholder]")) generated.remove();
     for (const token of Array.from(root.querySelectorAll("[data-kp-token]")).reverse()) token.replaceWith(...Array.from(token.childNodes));
     for (const element of root.querySelectorAll("[data-kp-line], [data-kp-rendered], [data-kp-autospace]")) {
@@ -408,7 +481,7 @@
     for (const el of node.querySelectorAll("[data-kp-rendered='1']")) release(el);
   }
 
-  function render(el, tokens, units, result, firstLineIndent) {
+  function render(el, tokens, units, result, firstLineIndent, alignment) {
     if (!result.lines?.length) return;
     ensureOriginal(el);
     const fragment = document.createDocumentFragment();
@@ -423,12 +496,12 @@
       lineEl.style.whiteSpace = "nowrap";
       lineEl.style.wordBreak = "normal";
       lineEl.style.overflowWrap = "normal";
-      lineEl.style.textAlign = "start";
-      lineEl.style.textAlignLast = "start";
+      lineEl.style.textAlign = alignment.textAlign;
+      lineEl.style.textAlignLast = alignment.textAlignLast;
       lineEl.style.setProperty("--kp-line-ratio", String(line.ratio));
       const state = { path: null, leaf: null };
       const lineUnits = units.slice(line.start, line.end);
-      const adjustments = distributeAdjustment(lineUnits, line);
+      const adjustments = alignment.adjustSpacing ? distributeAdjustment(lineUnits, line) : new Array(lineUnits.length).fill(0);
       for (let index = line.start; index < line.end; index++) {
         const tokenEl = appendToken(lineEl, tokens[index], state);
         const autoSpace = tokens[index].autoSpaceAfter && index + 1 < line.end ? (Number.parseFloat(getComputedStyle(el).fontSize) || 16) * 0.125 : 0;
@@ -467,6 +540,9 @@
       if (tokens.length < 2 || tokens.length > MAX_UNITS) { restore(el); return; }
       const units = measure(el, tokens);
       const cs = getComputedStyle(el);
+      const textAlign = cs.textAlign || "start";
+      const textAlignLast = cs.textAlignLast && cs.textAlignLast !== "auto" ? cs.textAlignLast : textAlign;
+      const adjustSpacing = textAlign === "justify" || textAlign === "start" || textAlign === "left";
       const lineWidth = el.clientWidth - (Number.parseFloat(cs.paddingLeft) || 0) - (Number.parseFloat(cs.paddingRight) || 0);
       const firstLineIndent = Math.max(0, Number.parseFloat(cs.textIndent) || 0);
       const result = callLayout({
@@ -484,7 +560,7 @@
         orphan_penalty: settings.orphanPenalty
       });
       if (result.fallback) { restore(el); return; }
-      render(el, tokens, units, result, firstLineIndent);
+      render(el, tokens, units, result, firstLineIndent, { textAlign, textAlignLast, adjustSpacing });
       if (Array.from(el.querySelectorAll(":scope > [data-kp-line]")).some(line => line.scrollWidth > line.getBoundingClientRect().width + 1)) {
         restore(el);
         return;
@@ -533,7 +609,15 @@
   }
 
   async function start() {
-    await loadWasm();
+    try {
+      await loadWasm();
+      document.documentElement.dataset.kpExtensionState = "ready";
+    } catch (error) {
+      startupError = error instanceof Error ? error.message : String(error);
+      document.documentElement.dataset.kpExtensionState = "error";
+      console.error("[TeX Line Breaker] failed to load layout core", error);
+      return;
+    }
     resizeObserver = new ResizeObserver(entries => {
       if (muting) return;
       for (const entry of entries) {
@@ -566,13 +650,13 @@
     });
     observer.observe(document.documentElement, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ["class", "style", "lang", "dir", "data-sfs-replaced"] });
     chrome.storage.onChanged.addListener((_, area) => { if (area === "sync") reloadSettings(); });
-    chrome.runtime.onMessage.addListener(message => {
-      if (message?.type === "kp-rerender") { restoreAll(); scheduleScan(document); }
-      if (message?.type === "kp-restore") restoreAll();
-    });
     await reloadSettings();
     document.fonts?.ready?.then(() => scheduleScan(document)).catch(() => {});
   }
 
-  start().catch(error => console.error("[TeX Line Breaker] failed to start", error));
+  start().catch(error => {
+    startupError = error instanceof Error ? error.message : String(error);
+    document.documentElement.dataset.kpExtensionState = "error";
+    console.error("[TeX Line Breaker] failed to start", error);
+  });
 })();

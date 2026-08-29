@@ -210,31 +210,45 @@
     };
   }
 
-  function punctuationProfile(token, em, compressionEnabled = true, hangingEnabled = true) {
+  function punctuationProfile(token, em, compressionEnabled = true, hangingEnabled = true, measured = {}) {
     const first = token?.text?.at(0);
     const last = token?.text?.at(-1);
     if (token?.type !== "punct") return { shrink: 0, beforeShrink: 0, afterShrink: 0, startProtrusion: 0, endProtrusion: 0 };
-    const beforeShrink = compressionEnabled && CLOSING.has(last) ? em * (FULLWIDTH_HANGING_END.has(last) ? 0.5 : 0.25) : 0;
-    const afterShrink = compressionEnabled && OPENING.has(first) ? em * 0.25 : 0;
+    const advance = Math.max(0, Number(measured.advance) || 0);
+    const leftBearing = Math.max(0, Number(measured.leftBearing) || 0);
+    const rightBearing = Math.max(0, Number(measured.rightBearing) || 0);
+    const fullwidth = FULLWIDTH_HANGING_END.has(last);
+    const beforeFallback = em * (fullwidth ? 0.5 : 0.25);
+    const afterFallback = em * 0.25;
+    const beforeShrink = compressionEnabled && CLOSING.has(last)
+      ? Math.min(advance || beforeFallback, Math.max(leftBearing, beforeFallback))
+      : 0;
+    const afterShrink = compressionEnabled && OPENING.has(first)
+      ? Math.min(advance || afterFallback, Math.max(rightBearing, afterFallback))
+      : 0;
+    const startFallback = em * 0.5;
+    const endFallback = em * (fullwidth ? 0.85 : 0.5);
+    let startProtrusion = hangingEnabled && HANGING_START.has(first)
+      ? Math.min(advance || startFallback, Math.max(leftBearing, startFallback))
+      : 0;
+    let endProtrusion = hangingEnabled && HANGING_END.has(last)
+      ? Math.min(advance || endFallback, Math.max(rightBearing, endFallback))
+      : 0;
+    const glyphAdvance = advance || em;
+    startProtrusion = Math.min(startProtrusion, Math.max(0, glyphAdvance - afterShrink));
+    endProtrusion = Math.min(endProtrusion, Math.max(0, glyphAdvance - beforeShrink));
     return {
       shrink: beforeShrink + afterShrink,
       beforeShrink,
       afterShrink,
-      startProtrusion: hangingEnabled && HANGING_START.has(first) ? em * 0.5 : 0,
-      // A full-em protrusion can be completely clipped by common article
-      // containers using overflow:hidden. Half-em optical hanging keeps the
-      // punctuation visible while its compressed side bearing supplies the
-      // remaining capacity.
-      endProtrusion: hangingEnabled && HANGING_END.has(last) ? em * 0.5 : 0
+      startProtrusion,
+      endProtrusion
     };
   }
 
   function tokenSpacingStyle(adjustment = 0, autoSpace = 0) {
     const spacing = Number(adjustment) + Number(autoSpace);
-    if (!Number.isFinite(spacing) || Math.abs(spacing) < 0.01) return { paddingInlineEnd: 0, marginInlineEnd: 0 };
-    return spacing > 0
-      ? { paddingInlineEnd: spacing, marginInlineEnd: 0 }
-      : { paddingInlineEnd: 0, marginInlineEnd: spacing };
+    return { letterSpacing: Number.isFinite(spacing) && Math.abs(spacing) >= 0.01 ? spacing : 0 };
   }
 
   function shrinkCapacityForToken(token, width, em, maxShrink, punctuationShrink = 0) {
@@ -243,7 +257,7 @@
   }
 
   function hangingBreakPenalty(penalty, endProtrusion, enabled = true) {
-    return Number(penalty) - (enabled && Number(endProtrusion) > 0 ? 50 : 0);
+    return Number(penalty) - (enabled && Number(endProtrusion) > 0 ? 180 : 0);
   }
 
   function distributeAdjustment(units, line) {

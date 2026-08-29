@@ -1,11 +1,10 @@
 param(
-  [string]$Version = "0.3.1",
+  [string]$Version = "0.3.2",
   [string]$OutputDirectory = "D:\Downloads"
 )
 
 $ErrorActionPreference = "Stop"
 $repository = Split-Path -Parent $PSScriptRoot
-$stage = Join-Path ([System.IO.Path]::GetTempPath()) "tex-line-breaker-extension-release"
 $zip = Join-Path $OutputDirectory "tex-line-breaker-extension-v$Version.zip"
 $runtimeFiles = @(
   "manifest.json",
@@ -25,17 +24,29 @@ $runtimeFiles = @(
   "wasm\tex_line_breaker_core.wasm"
 )
 
-if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
-New-Item -ItemType Directory -Path $stage | Out-Null
-foreach ($relative in $runtimeFiles) {
-  $source = Join-Path $repository $relative
-  if (-not (Test-Path -LiteralPath $source)) { throw "Missing runtime file: $relative" }
-  $destination = Join-Path $stage $relative
-  New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination) | Out-Null
-  Copy-Item -LiteralPath $source -Destination $destination -Force
-}
-
 New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
 if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
-Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $zip -CompressionLevel Optimal
+
+# Compress-Archive on some Windows builds writes backslashes into ZIP entry
+# names. Chromium's unpacked-extension importer then turns the separator into
+# a replacement character, so wasm/foo.wasm becomes one flat, unreadable file.
+# Write entries explicitly with ZIP-standard forward slashes.
+Add-Type -AssemblyName System.IO.Compression
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+$archive = [System.IO.Compression.ZipFile]::Open($zip, [System.IO.Compression.ZipArchiveMode]::Create)
+try {
+  foreach ($relative in $runtimeFiles) {
+    $source = Join-Path $repository $relative
+    if (-not (Test-Path -LiteralPath $source)) { throw "Missing runtime file: $relative" }
+    $entryName = $relative.Replace("\", "/")
+    [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+      $archive,
+      $source,
+      $entryName,
+      [System.IO.Compression.CompressionLevel]::Optimal
+    ) | Out-Null
+  }
+} finally {
+  $archive.Dispose()
+}
 Write-Output $zip
