@@ -481,7 +481,7 @@
     for (const el of node.querySelectorAll("[data-kp-rendered='1']")) release(el);
   }
 
-  function render(el, tokens, units, result, firstLineIndent, alignment) {
+  function render(el, tokens, units, result, firstLineIndent) {
     if (!result.lines?.length) return;
     ensureOriginal(el);
     const fragment = document.createDocumentFragment();
@@ -496,12 +496,17 @@
       lineEl.style.whiteSpace = "nowrap";
       lineEl.style.wordBreak = "normal";
       lineEl.style.overflowWrap = "normal";
-      lineEl.style.textAlign = alignment.textAlign;
-      lineEl.style.textAlignLast = alignment.textAlignLast;
+      // Each generated span is a separate CSS line box. Letting a site's
+      // text-align:justify reach it makes the browser justify every span as if
+      // it were a complete paragraph, including the real last/forced line.
+      // KP already supplies the exact per-boundary adjustment, so the browser
+      // must not perform a second justification pass.
+      lineEl.style.textAlign = "start";
+      lineEl.style.textAlignLast = "start";
       lineEl.style.setProperty("--kp-line-ratio", String(line.ratio));
       const state = { path: null, leaf: null };
       const lineUnits = units.slice(line.start, line.end);
-      const adjustments = alignment.adjustSpacing ? distributeAdjustment(lineUnits, line) : new Array(lineUnits.length).fill(0);
+      const adjustments = distributeAdjustment(lineUnits, line);
       for (let index = line.start; index < line.end; index++) {
         const tokenEl = appendToken(lineEl, tokens[index], state);
         const autoSpace = tokens[index].autoSpaceAfter && index + 1 < line.end ? (Number.parseFloat(getComputedStyle(el).fontSize) || 16) * 0.125 : 0;
@@ -540,9 +545,6 @@
       if (tokens.length < 2 || tokens.length > MAX_UNITS) { restore(el); return; }
       const units = measure(el, tokens);
       const cs = getComputedStyle(el);
-      const textAlign = cs.textAlign || "start";
-      const textAlignLast = cs.textAlignLast && cs.textAlignLast !== "auto" ? cs.textAlignLast : textAlign;
-      const adjustSpacing = textAlign === "justify" || textAlign === "start" || textAlign === "left";
       const lineWidth = el.clientWidth - (Number.parseFloat(cs.paddingLeft) || 0) - (Number.parseFloat(cs.paddingRight) || 0);
       const firstLineIndent = Math.max(0, Number.parseFloat(cs.textIndent) || 0);
       const result = callLayout({
@@ -560,7 +562,7 @@
         orphan_penalty: settings.orphanPenalty
       });
       if (result.fallback) { restore(el); return; }
-      render(el, tokens, units, result, firstLineIndent, { textAlign, textAlignLast, adjustSpacing });
+      render(el, tokens, units, result, firstLineIndent);
       if (Array.from(el.querySelectorAll(":scope > [data-kp-line]")).some(line => line.scrollWidth > line.getBoundingClientRect().width + 1)) {
         restore(el);
         return;
