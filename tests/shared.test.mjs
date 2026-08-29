@@ -5,10 +5,23 @@ import test from "node:test";
 const require = createRequire(import.meta.url);
 const shared = require("../shared.js");
 
+test("settings normalization rejects corrupt stored values", () => {
+  const settings = shared.normalizeSettings({ tolerance: -5, maxStretch: 99, hyphenation: "yes", siteRules: [{ domain: "https://www.Example.com/path", enabled: true }, null] });
+  assert.equal(settings.tolerance, 1);
+  assert.equal(settings.maxStretch, 1);
+  assert.equal(settings.hyphenation, shared.DEFAULTS.hyphenation);
+  assert.deepEqual(settings.siteRules, [{ domain: "example.com", enabled: true }]);
+});
+
 test("site rule overrides global setting and matches subdomains", () => {
   const settings = { ...shared.DEFAULTS, globalEnabled: true, siteRules: [{ domain: "example.com", enabled: false }] };
   assert.equal(shared.effectiveEnabled(settings, "www.example.com"), false);
   assert.equal(shared.effectiveEnabled(settings, "other.test"), true);
+});
+
+test("the most specific site rule wins", () => {
+  const settings = { ...shared.DEFAULTS, siteRules: [{ domain: "example.com", enabled: false }, { domain: "docs.example.com", enabled: true }] };
+  assert.equal(shared.effectiveEnabled(settings, "docs.example.com"), true);
 });
 
 test("CJK punctuation prohibition prevents illegal breaks", () => {
@@ -30,6 +43,20 @@ test("mixed CJK and English has a legal script boundary", () => {
   const tokens = shared.applyBreakRules(shared.tokenizeText("中文English测试"), true);
   assert.equal(tokens.some(token => token.canBreakAfter), true);
   assert.equal(tokens.at(-1).canBreakAfter, true);
+});
+
+test("hyphenation preserves the original break after the final part", async () => {
+  await import("../hyphenation-en-us.js");
+  const hyphenate = shared.createPatternHyphenator(globalThis.TexLineBreakerHyphenationEnUs);
+  const source = shared.applyBreakRules(shared.tokenizeText("hyphenation测试"), true);
+  const tokens = shared.hyphenateTokens(source, hyphenate, true);
+  const lastEnglish = tokens.findLast(token => token.type === "word");
+  assert.equal(lastEnglish.canBreakAfter, true);
+});
+
+test("supplementary Han characters are classified as CJK", () => {
+  const tokens = shared.tokenizeText("𠀀A");
+  assert.equal(tokens[0].type, "cjk");
 });
 
 test("synthetic Auto Spacing appears only at CJK-Western boundaries", () => {
@@ -59,6 +86,21 @@ test("punctuation profile exposes compression and optical protrusion", () => {
   const profile = shared.punctuationProfile({ text: "。", type: "punct" }, 20, true);
   assert.equal(profile.shrink, 5);
   assert.equal(profile.endProtrusion, 10);
+});
+
+test("line adjustment is conserved and never placed after the final unit", () => {
+  const units = [{ stretch: 10, shrink: 4, visible_units: 1 }, { stretch: 20, shrink: 8, visible_units: 1 }, { stretch: 100, shrink: 100, visible_units: 1 }];
+  const stretch = shared.distributeAdjustment(units, { adjustment: 15, emergency_stretch: 0 });
+  assert.ok(Math.abs(stretch.reduce((sum, value) => sum + value, 0) - 15) < 1e-9);
+  assert.equal(stretch.at(-1), 0);
+  const shrink = shared.distributeAdjustment(units, { adjustment: -6, emergency_stretch: 0 });
+  assert.ok(Math.abs(shrink.reduce((sum, value) => sum + value, 0) + 6) < 1e-9);
+});
+
+test("emergency stretch is distributed only between visible boxes", () => {
+  const units = [{ stretch: 0, shrink: 0, visible_units: 1 }, { stretch: 0, shrink: 0, visible_units: 1 }, { stretch: 0, shrink: 0, visible_units: 1 }];
+  const values = shared.distributeAdjustment(units, { adjustment: 12, emergency_stretch: 12 });
+  assert.deepEqual(values, [6, 6, 0]);
 });
 
 test("TeX pattern hyphenator splits an English word deterministically", async () => {

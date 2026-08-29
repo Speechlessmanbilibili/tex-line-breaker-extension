@@ -7,6 +7,7 @@
 - TeX box/glue/penalty 动态规划与四级 fitness class。
 - `pretolerance`、允许 discretionary hyphenation 的 `tolerance`、`emergency stretch` 三遍求解。
 - 按 WASM 结果精确分配字间/空格伸缩，不依赖浏览器再次自动断行。
+- 前缀度量和可达状态剪枝使核心保持 O(n²) 候选搜索，避免长 CJK 段落退化到 O(n³)。
 - CJK 行首/行末禁则、小假名/长音/重复符号禁则。
 - CJK 标点挤压与连续标点压缩。
 - 行首/行末悬挂标点/光学边缘对齐。
@@ -15,6 +16,8 @@
 - 基础行罚值、相邻行 fitness、连续断词、段末断词、过短末行、末行孤字 demerits。
 - 保留链接、粗体、斜体等简单 inline DOM；关闭时完整恢复原节点。
 - 字体加载、容器缩放和动态页面增量重排。
+- 正确处理 `text-indent`、站点直接修改已排版文本、SPA 删除节点和损坏的旧设置值。
+- WASM fallback 或重建后检测到行溢出时立即恢复浏览器原生布局。
 
 ## 与 Auto Spacing 共存
 
@@ -30,7 +33,7 @@
 
 - 全局开关默认关闭；站点规则优先于全局设置并匹配子域名。
 - 可配置容差、紧急伸缩、拉伸/压缩、CJK 特性及各类 demerits。
-- 自动跳过编辑器、代码、表格、媒体、flex/grid、复杂组件和过长段落。
+- 自动跳过编辑器、代码、表格、媒体、flex/grid、RTL/bidi、伪元素生成文字、复杂 inline box 和超过 1600 排版单元的段落。
 - 算法或测量失败时恢复浏览器原生布局。
 
 这是段落级排版器，不是完整 TeX 文档系统。分页 widow/orphan、浮动体、脚注、数学排版、河流检测和字形轮廓级扩展不属于任意网页 content script 可可靠控制的范围；其中段落末尾的孤字/短行已用 demerits 做段落级等价约束。
@@ -49,7 +52,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 ## 正式发行 ID
 
-从 v0.2.0 起清单固定公钥，v0.2.2 及后续正式发行 ID 为：
+从 v0.2.0 起清单固定公钥，v0.3.0 及后续正式发行 ID 为：
 
 ```text
 oicdbilhkpbjgbdbjklighpmkcbncfhp

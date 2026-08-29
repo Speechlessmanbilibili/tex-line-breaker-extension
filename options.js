@@ -1,6 +1,6 @@
 (() => {
   "use strict";
-  const { DEFAULTS } = globalThis.TexLineBreakerShared;
+  const { DEFAULTS, normalizeSettings } = globalThis.TexLineBreakerShared;
   const $ = id => document.getElementById(id);
 
   function addRule(rule = {}) {
@@ -60,7 +60,7 @@
     return Math.min(max, Math.max(min, Number.isFinite(value) ? value : DEFAULTS[id]));
   }
 
-  async function load() { fill({ ...DEFAULTS, ...(await chrome.storage.sync.get(DEFAULTS)) }); }
+  async function load() { fill(normalizeSettings(await chrome.storage.sync.get(null))); }
   async function save() { await chrome.storage.sync.set(collect()); $("status").textContent = "已保存，打开的网页会自动更新"; setTimeout(() => $("status").textContent = "", 2200); }
   async function reset() { await chrome.storage.sync.set(DEFAULTS); fill(DEFAULTS); $("status").textContent = "已恢复默认"; }
   $("addSite").addEventListener("click", () => addRule());

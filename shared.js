@@ -21,13 +21,35 @@
     siteRules: []
   });
 
-  const CJK_RE = /[\u2e80-\u2fff\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/u;
+  const CJK_RE = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Bopomofo}]/u;
   const OPENING = new Set(["（", "［", "｛", "〔", "〈", "《", "「", "『", "【", "〖", "〘", "〚", "‘", "“", "｟", "«", "‹", "(", "[", "{", "\"", "'"]);
   const CLOSING = new Set(["，", "。", "、", "；", "：", "！", "？", "）", "］", "｝", "〕", "〉", "》", "」", "』", "】", "〗", "〙", "〛", "’", "”", "｠", "»", "›", "!", "?", ".", ",", ";", ":", "%", "‰", "°", ")", "]", "}", "\"", "'"]);
   const NON_STARTING = new Set([...CLOSING, "…", "—", "～", "~", "・", "·", "ゝ", "ゞ", "々", "ー", "ぁ", "ぃ", "ぅ", "ぇ", "ぉ", "っ", "ゃ", "ゅ", "ょ", "ゎ", "ァ", "ィ", "ゥ", "ェ", "ォ", "ッ", "ャ", "ュ", "ョ", "ヮ", "ヵ", "ヶ"]);
   const NON_ENDING = new Set([...OPENING, "￥", "$", "£", "€", "¥"]);
   const HANGING_END = new Set(["，", "。", "、", "；", "：", "！", "？", ",", ".", ";", ":", "!", "?", "’", "”", "」", "』", "》", "〉", "）", ")", "]", "}"]);
   const HANGING_START = new Set([...OPENING]);
+
+  function normalizeSettings(stored = {}) {
+    const source = stored && typeof stored === "object" ? stored : {};
+    const settings = { ...DEFAULTS };
+    for (const key of ["globalEnabled", "cjkRules", "punctuationCompression", "hangingPunctuation", "hyphenation"]) {
+      if (typeof source[key] === "boolean") settings[key] = source[key];
+    }
+    const ranges = {
+      pretolerance: [0, 10], tolerance: [1, 10], emergencyStretch: [0, 1], maxStretch: [0, 1], maxShrink: [0, 1],
+      linePenalty: [0, 100], fitnessDemerits: [0, 50_000], doubleHyphenDemerits: [0, 50_000], finalHyphenDemerits: [0, 50_000],
+      shortLastLinePenalty: [0, 50_000], orphanPenalty: [0, 50_000]
+    };
+    for (const [key, [minimum, maximum]] of Object.entries(ranges)) {
+      const value = Number(source[key]);
+      if (Number.isFinite(value)) settings[key] = Math.min(maximum, Math.max(minimum, value));
+    }
+    settings.siteRules = Array.isArray(source.siteRules) ? source.siteRules.map(rule => ({
+      domain: normalizeDomain(rule?.domain),
+      enabled: rule?.enabled === true
+    })).filter(rule => rule.domain) : [];
+    return settings;
+  }
 
   function normalizeDomain(value) {
     return String(value || "").trim().toLowerCase()
@@ -42,15 +64,9 @@
   }
 
   function effectiveEnabled(settings, host) {
-    const matched = (settings.siteRules || []).find(rule => matchesDomain(host, rule.domain));
+    const matched = (settings.siteRules || []).filter(rule => matchesDomain(host, rule.domain))
+      .sort((left, right) => normalizeDomain(right.domain).length - normalizeDomain(left.domain).length)[0];
     return matched ? matched.enabled === true : settings.globalEnabled === true;
-  }
-
-  function classify(text) {
-    if (/^\s+$/u.test(text)) return "space";
-    if (CJK_RE.test(text)) return "cjk";
-    if (/^[\p{L}\p{N}_]+$/u.test(text)) return "word";
-    return "punct";
   }
 
   function tokenizeText(text) {
@@ -90,7 +106,7 @@
       const next = tokens[index + 1];
       let canBreakAfter = false;
       let penalty = 0;
-      let forcedBreakAfter = token.forcedBreakAfter === true;
+      const forcedBreakAfter = token.forcedBreakAfter === true;
       let flagged = false;
       let insert = "";
       if (!next) canBreakAfter = true;
@@ -115,7 +131,7 @@
         result.push(token);
         continue;
       }
-      const parts = hyphenate(token.text);
+      const parts = hyphenate(token.text, token);
       if (!Array.isArray(parts) || parts.length < 2 || parts.join("") !== token.text) {
         result.push(token);
         continue;
@@ -127,7 +143,7 @@
           text: part,
           start: offset,
           end: offset + part.length,
-          canBreakAfter: index + 1 < parts.length,
+          canBreakAfter: index + 1 < parts.length ? true : token.canBreakAfter,
           forcedBreakAfter: false,
           penalty: index + 1 < parts.length ? 50 : token.penalty,
           flagged: index + 1 < parts.length,
@@ -204,6 +220,34 @@
     };
   }
 
+  function distributeAdjustment(units, line) {
+    const adjustments = new Array(units.length).fill(0);
+    if (!Number.isFinite(line?.adjustment) || Math.abs(line.adjustment) < 0.01) return adjustments;
+    const capacities = units.map((unit, index) => index + 1 === units.length ? 0 : Math.max(0, line.adjustment >= 0 ? unit.stretch : unit.shrink));
+    let total = capacities.reduce((sum, value) => sum + value, 0);
+    const emergency = line.adjustment >= 0 ? Math.max(0, line.emergency_stretch || 0) : 0;
+    total += emergency;
+    if (total <= 0) return adjustments;
+    let assigned = 0;
+    let lastFlexible = -1;
+    capacities.forEach((capacity, index) => {
+      if (capacity <= 0) return;
+      lastFlexible = index;
+      adjustments[index] = line.adjustment * capacity / total;
+      assigned += adjustments[index];
+    });
+    if (emergency > 0) {
+      const visible = units.map((unit, index) => unit.visible_units > 0 ? index : -1).filter(index => index >= 0);
+      const boundaries = visible.slice(0, -1);
+      if (boundaries.length) {
+        const emergencyShare = line.adjustment * emergency / total / boundaries.length;
+        for (const index of boundaries) { adjustments[index] += emergencyShare; assigned += emergencyShare; lastFlexible = index; }
+      }
+    }
+    if (lastFlexible >= 0) adjustments[lastFlexible] += line.adjustment - assigned;
+    return adjustments;
+  }
+
   function needsAutoSpaceBetween(left, right) {
     if (!left || !right || left.type === "space" || right.type === "space") return false;
     const leftWestern = left.type === "word";
@@ -218,7 +262,7 @@
     }));
   }
 
-  const api = { DEFAULTS, OPENING, CLOSING, HANGING_START, HANGING_END, normalizeDomain, matchesDomain, effectiveEnabled, tokenizeText, applyBreakRules, hyphenateTokens, createPatternHyphenator, punctuationProfile, needsAutoSpaceBetween, applySyntheticAutoSpacing };
+  const api = { DEFAULTS, OPENING, CLOSING, HANGING_START, HANGING_END, normalizeSettings, normalizeDomain, matchesDomain, effectiveEnabled, tokenizeText, applyBreakRules, hyphenateTokens, createPatternHyphenator, punctuationProfile, distributeAdjustment, needsAutoSpaceBetween, applySyntheticAutoSpacing };
   globalThis.TexLineBreakerShared = api;
   if (typeof module !== "undefined" && module.exports) module.exports = api;
 })();

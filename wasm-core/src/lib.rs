@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::slice;
 
 const STATE_COUNT: usize = 8;
@@ -7,6 +8,8 @@ const STATE_COUNT: usize = 8;
 struct Input {
     units: Vec<Unit>,
     line_width: f64,
+    #[serde(default)]
+    first_line_indent: f64,
     #[serde(default = "default_pretolerance")]
     pretolerance: f64,
     #[serde(default = "default_tolerance")]
@@ -72,6 +75,7 @@ struct Metrics {
     forced: bool,
     visible_units: usize,
     natural_width: f64,
+    target_width: f64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -79,6 +83,70 @@ struct Previous {
     start: usize,
     state: usize,
     metrics: Metrics,
+}
+
+struct PrefixMetrics {
+    width: Vec<f64>,
+    stretch: Vec<f64>,
+    shrink: Vec<f64>,
+    visible_units: Vec<usize>,
+    visible_boxes: Vec<usize>,
+    forced_breaks: Vec<usize>,
+    next_visible: Vec<usize>,
+    previous_visible: Vec<usize>,
+}
+
+#[derive(Clone, Copy)]
+struct PassOptions {
+    allow_discretionary: bool,
+    tolerance: f64,
+    emergency_stretch: f64,
+}
+
+impl PrefixMetrics {
+    fn new(units: &[Unit]) -> Self {
+        let n = units.len();
+        let mut result = Self {
+            width: vec![0.0; n + 1],
+            stretch: vec![0.0; n + 1],
+            shrink: vec![0.0; n + 1],
+            visible_units: vec![0; n + 1],
+            visible_boxes: vec![0; n + 1],
+            forced_breaks: vec![0; n + 1],
+            next_visible: vec![n; n + 1],
+            previous_visible: vec![usize::MAX; n + 1],
+        };
+        for (index, unit) in units.iter().enumerate() {
+            result.width[index + 1] = result.width[index] + unit.width;
+            result.stretch[index + 1] = result.stretch[index] + unit.stretch;
+            result.shrink[index + 1] = result.shrink[index] + unit.shrink;
+            result.visible_units[index + 1] = result.visible_units[index] + unit.visible_units;
+            result.visible_boxes[index + 1] =
+                result.visible_boxes[index] + usize::from(unit.visible_units > 0);
+            result.forced_breaks[index + 1] =
+                result.forced_breaks[index] + usize::from(unit.forced_break_after);
+            result.previous_visible[index + 1] = if unit.visible_units > 0 {
+                index
+            } else {
+                result.previous_visible[index]
+            };
+        }
+        for index in (0..n).rev() {
+            result.next_visible[index] = if units[index].visible_units > 0 {
+                index
+            } else {
+                result.next_visible[index + 1]
+            };
+        }
+        result
+    }
+
+    fn sum(values: &[f64], start: usize, end: usize) -> f64 {
+        values[end] - values[start]
+    }
+    fn count(values: &[usize], start: usize, end: usize) -> usize {
+        values[end] - values[start]
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -160,35 +228,24 @@ fn state_flagged(state: usize) -> bool {
 
 fn line_metrics(
     input: &Input,
+    prefix: &PrefixMetrics,
     start: usize,
     end: usize,
     last: bool,
-    allow_discretionary: bool,
-    tolerance: f64,
-    emergency_stretch: f64,
+    options: PassOptions,
 ) -> Option<Metrics> {
-    if start >= end
-        || input.units[start..end.saturating_sub(1)]
-            .iter()
-            .any(|unit| unit.forced_break_after)
-    {
+    if start >= end || PrefixMetrics::count(&prefix.forced_breaks, start, end - 1) > 0 {
         return None;
     }
     let break_unit = &input.units[end - 1];
-    if break_unit.discretionary && !allow_discretionary && !last {
+    if break_unit.discretionary && !options.allow_discretionary && !last {
         return None;
     }
 
-    let mut width = 0.0;
-    let mut stretch = 0.0;
-    let mut shrink = 0.0;
-    let mut visible_units = 0;
-    for unit in &input.units[start..end] {
-        width += unit.width;
-        stretch += unit.stretch;
-        shrink += unit.shrink;
-        visible_units += unit.visible_units;
-    }
+    let mut width = PrefixMetrics::sum(&prefix.width, start, end);
+    let mut stretch = PrefixMetrics::sum(&prefix.stretch, start, end);
+    let mut shrink = PrefixMetrics::sum(&prefix.shrink, start, end);
+    let mut visible_units = PrefixMetrics::count(&prefix.visible_units, start, end);
     if break_unit.discard_at_break {
         width -= break_unit.width;
         stretch -= break_unit.stretch;
@@ -206,19 +263,27 @@ fn line_metrics(
         break_unit.insert_width_at_break
     };
     width += insert_width;
-    let first_visible = input.units[start..end]
-        .iter()
-        .find(|unit| unit.visible_units > 0);
-    let last_visible = input.units[start..end]
-        .iter()
-        .rev()
-        .find(|unit| unit.visible_units > 0);
-    let start_protrusion = first_visible.map_or(0.0, |unit| unit.start_protrusion);
-    let end_protrusion = last_visible.map_or(0.0, |unit| unit.end_protrusion);
+    let first_visible = prefix.next_visible[start];
+    let last_visible = prefix.previous_visible[end];
+    let start_protrusion = if first_visible < end {
+        input.units[first_visible].start_protrusion
+    } else {
+        0.0
+    };
+    let end_protrusion = if last_visible >= start && last_visible < end {
+        input.units[last_visible].end_protrusion
+    } else {
+        0.0
+    };
     let natural_width = (width - start_protrusion - end_protrusion).max(0.0);
-    let adjustment = input.line_width - natural_width;
+    let target_width = if start == 0 {
+        (input.line_width - input.first_line_indent).max(1.0)
+    } else {
+        input.line_width
+    };
+    let adjustment = target_width - natural_width;
 
-    if last && adjustment >= 0.0 && !break_unit.forced_break_after {
+    if adjustment >= 0.0 && (last || break_unit.forced_break_after) {
         return Some(Metrics {
             ratio: 0.0,
             badness: 0.0,
@@ -229,13 +294,20 @@ fn line_metrics(
             end_protrusion,
             insert_width,
             flagged: false,
-            forced: false,
+            forced: break_unit.forced_break_after,
             visible_units,
             natural_width,
+            target_width,
         });
     }
+    let visible_boxes = PrefixMetrics::count(&prefix.visible_boxes, start, end);
+    let usable_emergency = if adjustment >= 0.0 && visible_boxes >= 2 {
+        options.emergency_stretch.max(0.0)
+    } else {
+        0.0
+    };
     let available = if adjustment >= 0.0 {
-        stretch.max(0.0) + emergency_stretch.max(0.0)
+        stretch.max(0.0) + usable_emergency
     } else {
         shrink.max(0.0)
     };
@@ -243,7 +315,7 @@ fn line_metrics(
         return None;
     }
     let ratio = adjustment / available;
-    if ratio > tolerance || ratio < -1.0 {
+    if ratio > options.tolerance || ratio < -1.0 {
         return None;
     }
     Some(Metrics {
@@ -251,11 +323,7 @@ fn line_metrics(
         badness: badness(ratio),
         penalty: break_unit.penalty,
         adjustment,
-        emergency: if adjustment >= 0.0 {
-            emergency_stretch.max(0.0)
-        } else {
-            0.0
-        },
+        emergency: usable_emergency,
         start_protrusion,
         end_protrusion,
         insert_width,
@@ -263,6 +331,7 @@ fn line_metrics(
         forced: break_unit.forced_break_after,
         visible_units,
         natural_width,
+        target_width,
     })
 }
 
@@ -274,25 +343,27 @@ fn solve_pass(
     pass: &'static str,
 ) -> Option<Output> {
     let n = input.units.len();
+    let prefix = PrefixMetrics::new(&input.units);
+    let options = PassOptions {
+        allow_discretionary,
+        tolerance,
+        emergency_stretch,
+    };
     let mut best = vec![[f64::INFINITY; STATE_COUNT]; n + 1];
     let mut previous = vec![[None::<Previous>; STATE_COUNT]; n + 1];
     best[0][state_index(1, false)] = 0.0;
+    let mut starts = vec![0];
     for end in 1..=n {
         let last = end == n;
         let break_unit = &input.units[end - 1];
         if !last && !break_unit.can_break_after && !break_unit.forced_break_after {
             continue;
         }
-        for start in 0..end {
-            let Some(metrics) = line_metrics(
-                input,
-                start,
-                end,
-                last,
-                allow_discretionary,
-                tolerance,
-                emergency_stretch,
-            ) else {
+        for &start in starts.iter().take_while(|&&value| value < end) {
+            if best[start].iter().all(|value| !value.is_finite()) {
+                continue;
+            }
+            let Some(metrics) = line_metrics(input, &prefix, start, end, last, options) else {
                 continue;
             };
             let class = fitness(metrics.ratio);
@@ -309,7 +380,7 @@ fn solve_pass(
                         line_demerits -= metrics.penalty.powi(2);
                     }
                 }
-                if class.abs_diff(state_class(prior_state)) > 1 {
+                if start > 0 && class.abs_diff(state_class(prior_state)) > 1 {
                     line_demerits += input.fitness_demerits;
                 }
                 if metrics.flagged && state_flagged(prior_state) {
@@ -318,7 +389,7 @@ fn solve_pass(
                 if last && state_flagged(prior_state) {
                     line_demerits += input.final_hyphen_demerits;
                 }
-                if last && start > 0 && metrics.natural_width < input.line_width * 0.35 {
+                if last && start > 0 && metrics.natural_width < metrics.target_width * 0.35 {
                     line_demerits += input.short_last_line_penalty;
                 }
                 if last && start > 0 && metrics.visible_units <= 1 {
@@ -334,6 +405,9 @@ fn solve_pass(
                     });
                 }
             }
+        }
+        if best[end].iter().any(|value| value.is_finite()) {
+            starts.push(end);
         }
     }
     let (mut state, &demerits) = best[n]
@@ -485,13 +559,36 @@ pub unsafe extern "C" fn dealloc(ptr: *mut u8, len: usize) {
 /// `ptr` must reference at least `len` readable bytes for the duration of the call.
 #[no_mangle]
 pub unsafe extern "C" fn layout(ptr: *const u8, len: usize) -> u64 {
-    let Ok(input) = serde_json::from_slice::<Input>(slice::from_raw_parts(ptr, len)) else {
-        return 0;
-    };
-    if input.units.is_empty() || input.line_width <= 0.0 {
+    if ptr.is_null() || len == 0 {
         return 0;
     }
-    encode(solve(&input))
+    catch_unwind(AssertUnwindSafe(|| {
+        let Ok(input) = serde_json::from_slice::<Input>(slice::from_raw_parts(ptr, len)) else {
+            return 0;
+        };
+        let valid_number = |value: f64| value.is_finite();
+        if input.units.is_empty()
+            || !valid_number(input.line_width)
+            || input.line_width <= 0.0
+            || !valid_number(input.first_line_indent)
+            || !valid_number(input.pretolerance)
+            || !valid_number(input.tolerance)
+            || !valid_number(input.emergency_stretch)
+            || input.units.iter().any(|unit| {
+                !valid_number(unit.width)
+                    || !valid_number(unit.stretch)
+                    || !valid_number(unit.shrink)
+                    || !valid_number(unit.penalty)
+                    || unit.width < 0.0
+                    || unit.stretch < 0.0
+                    || unit.shrink < 0.0
+            })
+        {
+            return 0;
+        }
+        encode(solve(&input))
+    }))
+    .unwrap_or(0)
 }
 
 fn encode(output: Output) -> u64 {
@@ -531,6 +628,7 @@ mod tests {
         Input {
             units,
             line_width,
+            first_line_indent: 0.0,
             pretolerance: 1.0,
             tolerance: 3.0,
             emergency_stretch: 0.0,
@@ -584,11 +682,72 @@ mod tests {
 
     #[test]
     fn uses_emergency_pass_when_normal_stretch_is_insufficient() {
-        let mut data = input(vec![unit(70.0, true), unit(70.0, true)], 100.0);
+        let mut data = input(
+            vec![unit(45.0, true), unit(45.0, true), unit(45.0, true)],
+            100.0,
+        );
         data.pretolerance = 0.1;
         data.tolerance = 0.5;
-        data.emergency_stretch = 60.0;
+        data.emergency_stretch = 30.0;
         let output = solve(&data);
         assert_eq!(output.pass, "emergency");
+    }
+
+    #[test]
+    fn forced_underfull_line_stays_ragged() {
+        let mut forced = unit(0.0, true);
+        forced.forced_break_after = true;
+        forced.discard_at_break = true;
+        forced.visible_units = 0;
+        let output = solve(&input(
+            vec![unit(30.0, false), forced, unit(20.0, true)],
+            100.0,
+        ));
+        assert!(!output.fallback);
+        assert_eq!(output.lines[0].ratio, 0.0);
+        assert!(output.lines[0].forced);
+    }
+
+    #[test]
+    fn emergency_stretch_requires_an_adjustable_boundary() {
+        let mut data = input(vec![unit(70.0, true), unit(20.0, true)], 100.0);
+        data.pretolerance = 0.1;
+        data.tolerance = 0.5;
+        data.emergency_stretch = 100.0;
+        data.units[0].stretch = 0.0;
+        data.units[0].shrink = 0.0;
+        let output = solve(&data);
+        assert_ne!(output.pass, "emergency");
+    }
+
+    #[test]
+    fn first_line_indent_reduces_only_the_first_measure() {
+        let mut data = input(
+            vec![unit(35.0, true), unit(35.0, true), unit(35.0, true)],
+            100.0,
+        );
+        data.first_line_indent = 20.0;
+        let output = solve(&data);
+        assert_eq!(output.lines[0].end, 2);
+        assert_eq!(output.lines[1].end, 3);
+    }
+
+    #[test]
+    fn first_line_has_no_synthetic_previous_fitness_penalty() {
+        let mut data = input(vec![unit(70.0, true), unit(20.0, true)], 100.0);
+        data.fitness_demerits = 50_000.0;
+        let output = solve(&data);
+        assert_eq!(output.lines.len(), 1);
+        assert_eq!(output.demerits, data.line_penalty.powi(2));
+    }
+
+    #[test]
+    fn long_cjk_like_input_remains_deterministic() {
+        let data = input((0..1_000).map(|_| unit(16.0, true)).collect(), 640.0);
+        let first = solve(&data);
+        let second = solve(&data);
+        assert!(!first.lines.is_empty());
+        assert_eq!(first.lines.len(), second.lines.len());
+        assert_eq!(first.demerits, second.demerits);
     }
 }

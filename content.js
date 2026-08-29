@@ -1,12 +1,15 @@
 (() => {
   "use strict";
-  const { DEFAULTS, effectiveEnabled, tokenizeText, applyBreakRules, hyphenateTokens, createPatternHyphenator, punctuationProfile, applySyntheticAutoSpacing } = globalThis.TexLineBreakerShared;
+  const { DEFAULTS, normalizeSettings, effectiveEnabled, tokenizeText, applyBreakRules, hyphenateTokens, createPatternHyphenator, punctuationProfile, distributeAdjustment, applySyntheticAutoSpacing } = globalThis.TexLineBreakerShared;
   const BLOCK_SELECTOR = "p, blockquote, article p, div";
   const COMPLEX_SELECTOR = "code, pre, kbd, samp, table, img, video, audio, canvas, svg, iframe, input, textarea, select, button, math";
-  const INLINE_TAGS = new Set(["A", "ABBR", "B", "BDI", "BDO", "BR", "CITE", "DEL", "EM", "I", "INS", "MARK", "Q", "S", "SMALL", "SPAN", "STRONG", "SUB", "SUP", "TIME", "U"]);
+  const INLINE_TAGS = new Set(["A", "ABBR", "B", "BR", "CITE", "DEL", "EM", "I", "INS", "MARK", "Q", "S", "SMALL", "SPAN", "STRONG", "SUB", "SUP", "TIME", "U"]);
   const MAX_CHARS = 8000;
+  const MAX_UNITS = 1600;
+  const SUPPORTED_INLINE_DISPLAY = new Set(["inline", "contents"]);
+  const TYPOGRAPHY_PROPERTIES = ["direction", "font-family", "font-feature-settings", "font-kerning", "font-optical-sizing", "font-size", "font-stretch", "font-style", "font-variation-settings", "font-weight", "letter-spacing", "margin-left", "margin-right", "padding-left", "padding-right", "border-left-style", "border-left-width", "border-right-style", "border-right-width", "text-autospace", "text-rendering", "text-transform", "vertical-align", "word-spacing"];
   const originals = new WeakMap();
-  const observed = new Set();
+  const rendered = new Set();
   const observedWidths = new WeakMap();
   let settings = { ...DEFAULTS };
   let wasm = null;
@@ -14,36 +17,62 @@
   let resizeObserver = null;
   let muting = false;
   let scanTimer = 0;
+  const pendingRoots = new Set();
   const hyphenateEnglish = createPatternHyphenator(globalThis.TexLineBreakerHyphenationEnUs);
 
   async function loadWasm() {
     const url = chrome.runtime.getURL("wasm/tex_line_breaker_core.wasm");
     const response = await fetch(url);
+    if (!response.ok) throw new Error(`Unable to load WASM: ${response.status}`);
     const bytes = await response.arrayBuffer();
     wasm = (await WebAssembly.instantiate(bytes, {})).instance.exports;
+    for (const name of ["memory", "alloc", "dealloc", "layout"]) {
+      if (!wasm[name]) throw new Error(`Missing WASM export: ${name}`);
+    }
   }
 
   function callLayout(input) {
     if (!wasm) throw new Error("WASM core is not ready");
     const encoded = new TextEncoder().encode(JSON.stringify(input));
     const inputPtr = wasm.alloc(encoded.length);
-    new Uint8Array(wasm.memory.buffer, inputPtr, encoded.length).set(encoded);
-    const packed = wasm.layout(inputPtr, encoded.length);
-    wasm.dealloc(inputPtr, encoded.length);
+    let packed;
+    try {
+      new Uint8Array(wasm.memory.buffer, inputPtr, encoded.length).set(encoded);
+      packed = wasm.layout(inputPtr, encoded.length);
+    } finally {
+      wasm.dealloc(inputPtr, encoded.length);
+    }
     if (packed === 0n) throw new Error("WASM layout failed");
     const outputPtr = Number(packed >> 32n);
     const outputLen = Number(packed & 0xffffffffn);
-    const json = new TextDecoder().decode(new Uint8Array(wasm.memory.buffer, outputPtr, outputLen));
-    wasm.dealloc(outputPtr, outputLen);
-    return JSON.parse(json);
+    try {
+      const json = new TextDecoder().decode(new Uint8Array(wasm.memory.buffer, outputPtr, outputLen));
+      return JSON.parse(json);
+    } finally {
+      wasm.dealloc(outputPtr, outputLen);
+    }
   }
 
   function simpleInlineTree(root) {
+    for (const pseudo of ["::before", "::after"]) {
+      const content = getComputedStyle(root, pseudo).content;
+      if (content && content !== "none" && content !== "normal") return false;
+    }
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
     let node;
     while ((node = walker.nextNode())) {
       if (node.matches(COMPLEX_SELECTOR)) return false;
       if (node !== root && !INLINE_TAGS.has(node.tagName)) return false;
+      if (node !== root && node.tagName !== "BR") {
+        const style = getComputedStyle(node);
+        if (!SUPPORTED_INLINE_DISPLAY.has(style.display)) return false;
+        if (style.position === "absolute" || style.position === "fixed" || style.position === "sticky" || style.float !== "none") return false;
+        if (style.direction === "rtl" || style.whiteSpace.includes("nowrap") || style.whiteSpace.includes("pre")) return false;
+      }
+      for (const pseudo of ["::before", "::after"]) {
+        const content = getComputedStyle(node, pseudo).content;
+        if (content && content !== "none" && content !== "normal") return false;
+      }
     }
     return true;
   }
@@ -58,6 +87,8 @@
     const cs = getComputedStyle(el);
     if (cs.display === "flex" || cs.display === "grid" || cs.display === "inline-flex" || cs.display === "inline-grid") return false;
     if (cs.whiteSpace.includes("nowrap") || cs.writingMode !== "horizontal-tb") return false;
+    if (cs.direction === "rtl") return false;
+    if (Number.parseFloat(cs.textIndent) < 0) return false;
     if (el.clientWidth < 80) return false;
     if (el.tagName === "DIV" && el.children.length > 0 && Array.from(el.children).some(child => !INLINE_TAGS.has(child.tagName))) return false;
     return true;
@@ -88,7 +119,12 @@
       for (const child of node.childNodes || []) visit(child);
     }
     visit(root);
-    return hyphenateTokens(applyBreakRules(tokens, settings.cjkRules), hyphenateEnglish, settings.hyphenation);
+    const hyphenateForContext = (word, token) => {
+      const owner = token.sourceNode?.parentElement?.closest?.("[lang]") || root.closest("[lang]") || document.documentElement;
+      const language = String(owner?.getAttribute?.("lang") || "").toLowerCase();
+      return !language || /^en(-|$)/u.test(language) ? hyphenateEnglish(word) : [word];
+    };
+    return hyphenateTokens(applyBreakRules(tokens, settings.cjkRules), hyphenateForContext, settings.hyphenation);
   }
 
   function textAutospaceActive(value) {
@@ -101,7 +137,9 @@
       originals.set(el, {
         nodes: Array.from(el.childNodes),
         textAutospaceValue: el.style.getPropertyValue("text-autospace"),
-        textAutospacePriority: el.style.getPropertyPriority("text-autospace")
+        textAutospacePriority: el.style.getPropertyPriority("text-autospace"),
+        textIndentValue: el.style.getPropertyValue("text-indent"),
+        textIndentPriority: el.style.getPropertyPriority("text-indent")
       });
     }
   }
@@ -138,6 +176,15 @@
     box.style.setProperty("max-width", "none", "important");
     box.style.setProperty("min-width", "0", "important");
     box.style.setProperty("contain", "layout style", "important");
+    const sourceElements = [root, ...root.querySelectorAll("*")];
+    const clonedElements = [box, ...box.querySelectorAll("*")];
+    sourceElements.forEach((source, index) => {
+      const clone = clonedElements[index];
+      if (!clone) return;
+      const style = getComputedStyle(source);
+      for (const property of TYPOGRAPHY_PROPERTIES) clone.style.setProperty(property, style.getPropertyValue(property), "important");
+    });
+    muting = true;
     document.documentElement.appendChild(box);
     const sourceTextNodes = [];
     const clonedTextNodes = [];
@@ -150,24 +197,31 @@
     const cloneBySource = new Map(sourceTextNodes.map((node, index) => [node, clonedTextNodes[index]]));
     const widths = [];
     let previous = 0;
-    for (const token of tokens) {
-      if (token.virtual) { widths.push(0); continue; }
-      const cloneNode = cloneBySource.get(token.sourceNode);
-      if (!cloneNode) throw new Error("Unable to map measurement text node");
-      const range = document.createRange();
-      range.setStart(box, 0);
-      range.setEnd(cloneNode, token.end);
-      const current = range.getBoundingClientRect().width;
-      widths.push(Math.max(0, current - previous));
-      previous = current;
+    try {
+      for (const token of tokens) {
+        if (token.virtual) { widths.push(0); continue; }
+        const cloneNode = cloneBySource.get(token.sourceNode);
+        if (!cloneNode) throw new Error("Unable to map measurement text node");
+        const range = document.createRange();
+        range.setStart(box, 0);
+        range.setEnd(cloneNode, token.end);
+        const current = range.getBoundingClientRect().width;
+        widths.push(Math.max(0, current - previous));
+        previous = current;
+      }
+    } finally {
+      box.remove();
+      muting = false;
     }
-    box.remove();
     const em = Number.parseFloat(rootStyle.fontSize) || 16;
     const syntheticSpacing = em * 0.125;
     const hyphenWidth = measureInsertedGlyph(root, "-");
     return widths.map((width, index) => {
       const token = tokens[index];
       const punctuation = punctuationProfile(token, em, settings.punctuationCompression);
+      const punctuationShrink = Math.min(punctuation.shrink, width * 0.5);
+      const startProtrusion = Math.min(punctuation.startProtrusion, width);
+      const endProtrusion = Math.min(punctuation.endProtrusion, width);
       const normalStretch = token.type === "space" ? Math.max(width * settings.maxStretch, em * 0.08) : (token.type === "cjk" ? em * settings.maxStretch : 0);
       const normalShrink = token.type === "space" ? Math.max(width * settings.maxShrink, em * 0.04) : (token.type === "cjk" ? em * settings.maxShrink : 0);
       return {
@@ -181,10 +235,10 @@
         discard_width_at_break: token.autoSpaceAfter ? syntheticSpacing : 0,
         insert_width_at_break: token.insert ? hyphenWidth : 0,
         stretch: normalStretch,
-        shrink: normalShrink + punctuation.shrink,
-        start_protrusion: settings.hangingPunctuation ? punctuation.startProtrusion : 0,
-        end_protrusion: settings.hangingPunctuation ? punctuation.endProtrusion : 0,
-        visible_units: token.type === "space" || token.type === "newline" ? 0 : Array.from(token.text).length
+        shrink: normalShrink + punctuationShrink,
+        start_protrusion: settings.hangingPunctuation ? startProtrusion : 0,
+        end_protrusion: settings.hangingPunctuation ? endProtrusion : 0,
+        visible_units: token.type === "space" || token.type === "newline" || token.text === "\u00ad" ? 0 : Array.from(token.text).length
       };
     });
   }
@@ -194,10 +248,10 @@
     const style = getComputedStyle(root);
     span.textContent = text;
     span.style.cssText = `position:fixed;left:-100000px;top:0;visibility:hidden;white-space:nowrap;font:${style.font};font-kerning:${style.fontKerning};font-feature-settings:${style.fontFeatureSettings};letter-spacing:${style.letterSpacing}`;
+    muting = true;
     document.documentElement.appendChild(span);
-    const width = span.getBoundingClientRect().width;
-    span.remove();
-    return width;
+    try { return span.getBoundingClientRect().width; }
+    finally { span.remove(); muting = false; }
   }
 
   function appendToken(lineEl, token, state, suppressTrailingAutoSpace) {
@@ -238,30 +292,6 @@
     parent.appendChild(spacer);
   }
 
-  function distributeAdjustment(units, line) {
-    const adjustments = new Array(units.length).fill(0);
-    if (!Number.isFinite(line.adjustment) || Math.abs(line.adjustment) < 0.01) return adjustments;
-    const capacities = units.map((unit, index) => index + 1 === units.length ? 0 : (line.adjustment >= 0 ? unit.stretch : unit.shrink));
-    let total = capacities.reduce((sum, value) => sum + Math.max(0, value), 0);
-    if (line.adjustment >= 0) total += Math.max(0, line.emergency_stretch || 0);
-    if (total <= 0) return adjustments;
-    let assigned = 0;
-    let lastFlexible = -1;
-    capacities.forEach((capacity, index) => {
-      if (capacity <= 0) return;
-      lastFlexible = index;
-      adjustments[index] = line.adjustment * capacity / total;
-      assigned += adjustments[index];
-    });
-    if (line.adjustment >= 0 && line.emergency_stretch > 0) {
-      const visible = units.map((unit, index) => unit.visible_units > 0 ? index : -1).filter(index => index >= 0);
-      const emergencyShare = line.adjustment * line.emergency_stretch / total / Math.max(1, visible.length - 1);
-      for (const index of visible.slice(0, -1)) { adjustments[index] += emergencyShare; assigned += emergencyShare; lastFlexible = index; }
-    }
-    if (lastFlexible >= 0) adjustments[lastFlexible] += line.adjustment - assigned;
-    return adjustments;
-  }
-
   function restore(el) {
     const original = originals.get(el);
     if (!original) return;
@@ -272,14 +302,64 @@
     } else {
       el.style.removeProperty("text-autospace");
     }
+    if (original.textIndentValue) {
+      el.style.setProperty("text-indent", original.textIndentValue, original.textIndentPriority);
+    } else {
+      el.style.removeProperty("text-indent");
+    }
     delete el.dataset.kpRendered;
     delete el.dataset.kpAutospace;
     el.style.removeProperty("--kp-line-ratio");
     originals.delete(el);
+    rendered.delete(el);
+    resizeObserver?.unobserve(el);
+    observedWidths.delete(el);
     queueMicrotask(() => { muting = false; });
   }
 
-  function render(el, tokens, units, result) {
+  function release(el) {
+    rendered.delete(el);
+    resizeObserver?.unobserve(el);
+    observedWidths.delete(el);
+  }
+
+  function cleanGeneratedContent(root) {
+    for (const generated of root.querySelectorAll("[data-kp-adjustment], [data-kp-autospace-spacer], [data-kp-discretionary], [data-kp-placeholder]")) generated.remove();
+    for (const element of root.querySelectorAll("[data-kp-line], [data-kp-rendered], [data-kp-autospace]")) {
+      delete element.dataset.kpLine;
+      delete element.dataset.kpRendered;
+      delete element.dataset.kpAutospace;
+    }
+  }
+
+  function adoptRenderedContent(el) {
+    const previous = originals.get(el);
+    if (!previous) return;
+    const fragment = document.createDocumentFragment();
+    for (const child of Array.from(el.childNodes)) {
+      if (child instanceof HTMLElement && child.dataset.kpLine) {
+        const clone = child.cloneNode(true);
+        cleanGeneratedContent(clone);
+        fragment.append(...Array.from(clone.childNodes));
+      } else {
+        const clone = child.cloneNode(true);
+        if (clone instanceof Element) cleanGeneratedContent(clone);
+        fragment.appendChild(clone);
+      }
+    }
+    originals.set(el, {
+      ...previous,
+      nodes: Array.from(fragment.childNodes)
+    });
+  }
+
+  function releaseRemovedTree(node) {
+    if (!(node instanceof Element)) return;
+    if (rendered.has(node)) release(node);
+    for (const el of node.querySelectorAll("[data-kp-rendered='1']")) release(el);
+  }
+
+  function render(el, tokens, units, result, firstLineIndent) {
     if (!result.lines?.length) return;
     ensureOriginal(el);
     const fragment = document.createDocumentFragment();
@@ -287,6 +367,7 @@
       const lineEl = document.createElement("span");
       lineEl.dataset.kpLine = String(lineIndex + 1);
       lineEl.style.display = "block";
+      lineEl.style.textIndent = lineIndex === 0 ? `${firstLineIndent}px` : "0px";
       lineEl.style.boxSizing = "content-box";
       lineEl.style.width = `calc(100% + ${line.start_protrusion + line.end_protrusion}px)`;
       lineEl.style.marginInlineStart = `${-line.start_protrusion}px`;
@@ -309,11 +390,19 @@
         hyphen.textContent = tokens[line.end - 1].insert;
         (state.leaf || lineEl).appendChild(hyphen);
       }
+      if (line.forced && !lineUnits.some(unit => unit.visible_units > 0)) {
+        const placeholder = document.createElement("br");
+        placeholder.dataset.kpPlaceholder = "1";
+        placeholder.setAttribute("aria-hidden", "true");
+        lineEl.appendChild(placeholder);
+      }
       fragment.appendChild(lineEl);
     });
     muting = true;
     el.replaceChildren(fragment);
+    el.style.textIndent = "0px";
     el.dataset.kpRendered = "1";
+    rendered.add(el);
     queueMicrotask(() => { muting = false; });
   }
 
@@ -324,13 +413,15 @@
       ensureOriginal(el);
       const syntheticAutoSpacing = prepareAutoSpacing(el);
       const tokens = applySyntheticAutoSpacing(collectTokens(el), syntheticAutoSpacing);
-      if (tokens.length < 2) { restore(el); return; }
+      if (tokens.length < 2 || tokens.length > MAX_UNITS) { restore(el); return; }
       const units = measure(el, tokens);
       const cs = getComputedStyle(el);
       const lineWidth = el.clientWidth - (Number.parseFloat(cs.paddingLeft) || 0) - (Number.parseFloat(cs.paddingRight) || 0);
+      const firstLineIndent = Math.max(0, Number.parseFloat(cs.textIndent) || 0);
       const result = callLayout({
         units,
         line_width: Math.max(1, lineWidth - 0.5),
+        first_line_indent: firstLineIndent,
         pretolerance: settings.pretolerance,
         tolerance: settings.tolerance,
         emergency_stretch: (Number.parseFloat(cs.fontSize) || 16) * settings.emergencyStretch,
@@ -341,9 +432,14 @@
         short_last_line_penalty: settings.shortLastLinePenalty,
         orphan_penalty: settings.orphanPenalty
       });
-      render(el, tokens, units, result);
-      observedWidths.set(el, el.getBoundingClientRect().width);
-      if (!observed.has(el)) { observed.add(el); resizeObserver.observe(el); }
+      if (result.fallback) { restore(el); return; }
+      render(el, tokens, units, result, firstLineIndent);
+      if (Array.from(el.querySelectorAll(":scope > [data-kp-line]")).some(line => line.scrollWidth > line.getBoundingClientRect().width + 1)) {
+        restore(el);
+        return;
+      }
+      observedWidths.set(el, el.clientWidth);
+      resizeObserver.observe(el);
     } catch (error) {
       restore(el);
       console.debug("[TeX Line Breaker] native layout retained", error);
@@ -352,21 +448,36 @@
 
   function scan(root = document) {
     if (!effectiveEnabled(settings, location.hostname)) { restoreAll(); return; }
-    const candidates = root instanceof Element && root.matches(BLOCK_SELECTOR) ? [root] : Array.from(root.querySelectorAll?.(BLOCK_SELECTOR) || []);
+    let candidates;
+    if (root instanceof Element) {
+      const found = new Set(root.querySelectorAll?.(BLOCK_SELECTOR) || []);
+      if (root.matches(BLOCK_SELECTOR)) found.add(root);
+      const ancestor = root.closest(BLOCK_SELECTOR);
+      if (ancestor) found.add(ancestor);
+      candidates = Array.from(found);
+    } else {
+      candidates = Array.from(root.querySelectorAll?.(BLOCK_SELECTOR) || []);
+    }
     for (const el of candidates) layoutElement(el);
   }
 
   function scheduleScan(root = document) {
+    pendingRoots.add(root?.isConnected === false ? document : root);
     clearTimeout(scanTimer);
-    scanTimer = setTimeout(() => scan(root), 120);
+    scanTimer = setTimeout(() => {
+      const roots = Array.from(pendingRoots);
+      pendingRoots.clear();
+      if (roots.includes(document)) { scan(document); return; }
+      for (const candidate of roots) scan(candidate);
+    }, 120);
   }
 
   function restoreAll() {
-    for (const el of document.querySelectorAll("[data-kp-rendered='1']")) restore(el);
+    for (const el of Array.from(rendered)) restore(el);
   }
 
   async function reloadSettings() {
-    settings = { ...DEFAULTS, ...(await chrome.storage.sync.get(DEFAULTS)) };
+    settings = normalizeSettings(await chrome.storage.sync.get(null));
     scheduleScan(document);
   }
 
@@ -375,7 +486,8 @@
     resizeObserver = new ResizeObserver(entries => {
       if (muting) return;
       for (const entry of entries) {
-        const width = entry.contentRect.width;
+        if (!entry.target.isConnected) { restore(entry.target); continue; }
+        const width = entry.target.clientWidth;
         const previous = observedWidths.get(entry.target);
         if (previous == null || Math.abs(width - previous) > 0.5) {
           observedWidths.set(entry.target, width);
@@ -386,23 +498,22 @@
     observer = new MutationObserver(mutations => {
       if (muting) return;
       for (const mutation of mutations) {
+        if (mutation.type === "characterData") {
+          const owner = mutation.target.parentElement?.closest?.("[data-kp-rendered='1']");
+          if (owner) { adoptRenderedContent(owner); restore(owner); }
+          scheduleScan(owner || mutation.target.parentElement || document);
+          continue;
+        }
         if (mutation.type === "childList") {
+          for (const removed of mutation.removedNodes) releaseRemovedTree(removed);
           const owner = mutation.target instanceof Element ? mutation.target.closest?.("[data-kp-rendered='1']") : mutation.target.parentElement?.closest?.("[data-kp-rendered='1']");
-          if (owner && !owner.querySelector(":scope > [data-kp-line]")) {
-            const previous = originals.get(owner);
-            originals.set(owner, {
-              nodes: Array.from(owner.childNodes),
-              textAutospaceValue: previous?.textAutospaceValue || "",
-              textAutospacePriority: previous?.textAutospacePriority || ""
-            });
-            delete owner.dataset.kpRendered;
-          }
-          scheduleScan(owner || (mutation.target instanceof Element ? mutation.target : document));
+          if (owner) { adoptRenderedContent(owner); restore(owner); }
+          scheduleScan(owner || (mutation.target instanceof Element ? mutation.target : mutation.target.parentElement || document));
         }
         if (mutation.type === "attributes") scheduleScan(mutation.target.closest?.(BLOCK_SELECTOR) || document);
       }
     });
-    observer.observe(document.documentElement, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ["data-sfs-replaced"] });
+    observer.observe(document.documentElement, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ["class", "style", "lang", "dir", "data-sfs-replaced"] });
     chrome.storage.onChanged.addListener((_, area) => { if (area === "sync") reloadSettings(); });
     chrome.runtime.onMessage.addListener(message => {
       if (message?.type === "kp-rerender") { restoreAll(); scheduleScan(document); }
