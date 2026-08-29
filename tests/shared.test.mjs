@@ -83,9 +83,38 @@ test("forced breaks take precedence over CJK line-start prohibition", () => {
 });
 
 test("punctuation profile exposes compression and optical protrusion", () => {
-  const profile = shared.punctuationProfile({ text: "。", type: "punct" }, 20, true);
-  assert.equal(profile.shrink, 5);
+  const profile = shared.punctuationProfile({ text: "。", type: "punct" }, 20, true, true);
+  assert.equal(profile.shrink, 10);
+  assert.equal(profile.beforeShrink, 10);
+  assert.equal(profile.afterShrink, 0);
   assert.equal(profile.endProtrusion, 10);
+  const opening = shared.punctuationProfile({ text: "（", type: "punct" }, 20, true, true);
+  assert.equal(opening.beforeShrink, 0);
+  assert.equal(opening.afterShrink, 5);
+});
+
+test("hanging punctuation is independent from punctuation compression", () => {
+  const profile = shared.punctuationProfile({ text: "，", type: "punct" }, 16, false, true);
+  assert.equal(profile.shrink, 0);
+  assert.equal(profile.endProtrusion, 8);
+});
+
+test("token spacing uses selectable padding for expansion and margin for compression", () => {
+  assert.deepEqual(shared.tokenSpacingStyle(2, 1), { paddingInlineEnd: 3, marginInlineEnd: 0 });
+  assert.deepEqual(shared.tokenSpacingStyle(-2, 0), { paddingInlineEnd: 0, marginInlineEnd: -2 });
+  assert.deepEqual(shared.tokenSpacingStyle(0, 0), { paddingInlineEnd: 0, marginInlineEnd: 0 });
+});
+
+test("ordinary CJK glyphs never expose shrink capacity", () => {
+  assert.equal(shared.shrinkCapacityForToken({ type: "cjk" }, 16, 16, 0.5, 0), 0);
+  assert.equal(shared.shrinkCapacityForToken({ type: "cjk" }, 16, 16, 0.5, 4), 4);
+  assert.equal(shared.shrinkCapacityForToken({ type: "space" }, 8, 16, 0.25, 0), 2);
+});
+
+test("a legal hanging punctuation break receives priority", () => {
+  assert.equal(shared.hangingBreakPenalty(0, 8, true), -50);
+  assert.equal(shared.hangingBreakPenalty(0, 0, true), 0);
+  assert.equal(shared.hangingBreakPenalty(25, 8, false), 25);
 });
 
 test("line adjustment is conserved and never placed after the final unit", () => {

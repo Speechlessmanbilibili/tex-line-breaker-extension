@@ -1,6 +1,6 @@
 (() => {
   "use strict";
-  const { DEFAULTS, normalizeSettings, effectiveEnabled, tokenizeText, applyBreakRules, hyphenateTokens, createPatternHyphenator, punctuationProfile, distributeAdjustment, applySyntheticAutoSpacing } = globalThis.TexLineBreakerShared;
+  const { DEFAULTS, normalizeSettings, effectiveEnabled, tokenizeText, applyBreakRules, hyphenateTokens, createPatternHyphenator, punctuationProfile, distributeAdjustment, tokenSpacingStyle, shrinkCapacityForToken, hangingBreakPenalty, applySyntheticAutoSpacing } = globalThis.TexLineBreakerShared;
   const BLOCK_SELECTOR = "p, blockquote, article p, div";
   const COMPLEX_SELECTOR = "code, pre, kbd, samp, table, img, video, audio, canvas, svg, iframe, input, textarea, select, button, math";
   const INLINE_TAGS = new Set(["A", "ABBR", "B", "BR", "CITE", "DEL", "EM", "I", "INS", "MARK", "Q", "S", "SMALL", "SPAN", "STRONG", "SUB", "SUP", "TIME", "U"]);
@@ -11,6 +11,7 @@
   const originals = new WeakMap();
   const rendered = new Set();
   const observedWidths = new WeakMap();
+  const overflowOverrides = new Map();
   let settings = { ...DEFAULTS };
   let wasm = null;
   let observer = null;
@@ -216,28 +217,32 @@
     const em = Number.parseFloat(rootStyle.fontSize) || 16;
     const syntheticSpacing = em * 0.125;
     const hyphenWidth = measureInsertedGlyph(root, "-");
+    const profiles = tokens.map(token => punctuationProfile(token, em, settings.punctuationCompression, settings.hangingPunctuation));
     return widths.map((width, index) => {
       const token = tokens[index];
-      const punctuation = punctuationProfile(token, em, settings.punctuationCompression);
-      const punctuationShrink = Math.min(punctuation.shrink, width * 0.5);
+      const punctuation = profiles[index];
+      const boundaryShrink = punctuation.afterShrink + (profiles[index + 1]?.beforeShrink || 0);
+      const punctuationShrink = Math.min(boundaryShrink, Math.max(width, widths[index + 1] || 0) * 0.5);
       const startProtrusion = Math.min(punctuation.startProtrusion, width);
       const endProtrusion = Math.min(punctuation.endProtrusion, width);
       const normalStretch = token.type === "space" ? Math.max(width * settings.maxStretch, em * 0.08) : (token.type === "cjk" ? em * settings.maxStretch : 0);
-      const normalShrink = token.type === "space" ? Math.max(width * settings.maxShrink, em * 0.04) : (token.type === "cjk" ? em * settings.maxShrink : 0);
       return {
         width: width + (token.autoSpaceAfter ? syntheticSpacing : 0),
         can_break_after: token.canBreakAfter,
         forced_break_after: token.forcedBreakAfter,
-        penalty: token.penalty,
+        // Prefer the legal break after a hanging closing mark. When the mark
+        // fits through punctuation compression plus protrusion, keep it on the
+        // current line instead of moving the preceding ideograph with it.
+        penalty: hangingBreakPenalty(token.penalty, endProtrusion, settings.hangingPunctuation),
         flagged: token.flagged,
         discretionary: Boolean(token.insert),
         discard_at_break: token.type === "space" || token.type === "newline",
         discard_width_at_break: token.autoSpaceAfter ? syntheticSpacing : 0,
         insert_width_at_break: token.insert ? hyphenWidth : 0,
         stretch: normalStretch,
-        shrink: normalShrink + punctuationShrink,
-        start_protrusion: settings.hangingPunctuation ? startProtrusion : 0,
-        end_protrusion: settings.hangingPunctuation ? endProtrusion : 0,
+        shrink: shrinkCapacityForToken(token, width, em, settings.maxShrink, punctuationShrink),
+        start_protrusion: startProtrusion,
+        end_protrusion: endProtrusion,
         visible_units: token.type === "space" || token.type === "newline" || token.text === "\u00ad" ? 0 : Array.from(token.text).length
       };
     });
@@ -254,48 +259,90 @@
     finally { span.remove(); muting = false; }
   }
 
-  function appendToken(lineEl, token, state, suppressTrailingAutoSpace) {
-    if (token.type === "newline") return;
+  function appendToken(lineEl, token, state) {
+    if (token.type === "newline") return null;
     const visibleText = token.text === "\u00ad" ? "" : token.text;
     const samePath = state.path?.length === token.wrappers.length && token.wrappers.every((wrapper, index) => wrapper === state.path[index]);
-    if (samePath && state.leaf) {
-      state.leaf.appendChild(document.createTextNode(visibleText));
-      if (token.autoSpaceAfter && !suppressTrailingAutoSpace) appendSyntheticSpace(state.leaf);
-      return;
+    if (!samePath || !state.leaf) {
+      let parent = lineEl;
+      for (const original of token.wrappers) {
+        const wrapper = original.cloneNode(false);
+        parent.appendChild(wrapper);
+        parent = wrapper;
+      }
+      state.path = token.wrappers;
+      state.leaf = parent;
     }
-    let parent = lineEl;
-    for (const original of token.wrappers) {
-      const wrapper = original.cloneNode(false);
-      parent.appendChild(wrapper);
-      parent = wrapper;
-    }
-    parent.appendChild(document.createTextNode(visibleText));
-    state.path = token.wrappers;
-    state.leaf = parent;
-    if (token.autoSpaceAfter && !suppressTrailingAutoSpace) appendSyntheticSpace(parent);
+    const tokenEl = document.createElement("span");
+    tokenEl.dataset.kpToken = "1";
+    tokenEl.style.display = "inline";
+    tokenEl.appendChild(document.createTextNode(visibleText));
+    state.leaf.appendChild(tokenEl);
+    return tokenEl;
   }
 
-  function appendSyntheticSpace(lineEl) {
-    const spacer = document.createElement("span");
-    spacer.dataset.kpAutospaceSpacer = "1";
-    spacer.setAttribute("aria-hidden", "true");
-    spacer.style.cssText = "display:inline-block;width:0.125em;user-select:none;pointer-events:none";
-    lineEl.appendChild(spacer);
+  function applyTokenSpacing(tokenEl, adjustment, autoSpace) {
+    if (!tokenEl) return;
+    const spacing = tokenSpacingStyle(adjustment, autoSpace);
+    if (spacing.paddingInlineEnd) tokenEl.style.paddingInlineEnd = `${spacing.paddingInlineEnd}px`;
+    if (spacing.marginInlineEnd) tokenEl.style.marginInlineEnd = `${spacing.marginInlineEnd}px`;
   }
 
-  function appendAdjustment(parent, pixels) {
-    if (!Number.isFinite(pixels) || Math.abs(pixels) < 0.01) return;
-    const spacer = document.createElement("span");
-    spacer.dataset.kpAdjustment = "1";
-    spacer.setAttribute("aria-hidden", "true");
-    spacer.style.cssText = `display:inline-block;width:0;height:0;margin-inline-end:${pixels}px;user-select:none;pointer-events:none`;
-    parent.appendChild(spacer);
+  function restoreInlineProperty(element, property, value, priority) {
+    if (value) element.style.setProperty(property, value, priority);
+    else element.style.removeProperty(property);
+  }
+
+  function allowHangingOverflow(el) {
+    let ancestor = el.parentElement;
+    let depth = 0;
+    while (ancestor && ancestor !== document.documentElement && depth < 10) {
+      const style = getComputedStyle(ancestor);
+      if (style.overflowX === "hidden" || style.overflowX === "clip") {
+        let override = overflowOverrides.get(ancestor);
+        if (!override) {
+          override = {
+            roots: new Set(),
+            overflowValue: ancestor.style.getPropertyValue("overflow"),
+            overflowPriority: ancestor.style.getPropertyPriority("overflow"),
+            overflowXValue: ancestor.style.getPropertyValue("overflow-x"),
+            overflowXPriority: ancestor.style.getPropertyPriority("overflow-x"),
+            overflowYValue: ancestor.style.getPropertyValue("overflow-y"),
+            overflowYPriority: ancestor.style.getPropertyPriority("overflow-y")
+          };
+          overflowOverrides.set(ancestor, override);
+          ancestor.dataset.kpOverflow = "1";
+          // A positioned/z-indexed child still cannot escape an ancestor's
+          // overflow clip. Override the clipping container itself, with enough
+          // priority to beat site styles, only while it owns rendered content.
+          ancestor.style.setProperty("overflow", "visible", "important");
+          ancestor.style.setProperty("overflow-x", "visible", "important");
+          ancestor.style.setProperty("overflow-y", "visible", "important");
+        }
+        override.roots.add(el);
+      }
+      ancestor = ancestor.parentElement;
+      depth += 1;
+    }
+  }
+
+  function releaseHangingOverflow(el) {
+    for (const [ancestor, override] of overflowOverrides) {
+      override.roots.delete(el);
+      if (override.roots.size) continue;
+      restoreInlineProperty(ancestor, "overflow", override.overflowValue, override.overflowPriority);
+      restoreInlineProperty(ancestor, "overflow-x", override.overflowXValue, override.overflowXPriority);
+      restoreInlineProperty(ancestor, "overflow-y", override.overflowYValue, override.overflowYPriority);
+      delete ancestor.dataset.kpOverflow;
+      overflowOverrides.delete(ancestor);
+    }
   }
 
   function restore(el) {
     const original = originals.get(el);
     if (!original) return;
     muting = true;
+    releaseHangingOverflow(el);
     el.replaceChildren(...original.nodes);
     if (original.textAutospaceValue) {
       el.style.setProperty("text-autospace", original.textAutospaceValue, original.textAutospacePriority);
@@ -318,6 +365,7 @@
   }
 
   function release(el) {
+    releaseHangingOverflow(el);
     rendered.delete(el);
     resizeObserver?.unobserve(el);
     observedWidths.delete(el);
@@ -325,6 +373,7 @@
 
   function cleanGeneratedContent(root) {
     for (const generated of root.querySelectorAll("[data-kp-adjustment], [data-kp-autospace-spacer], [data-kp-discretionary], [data-kp-placeholder]")) generated.remove();
+    for (const token of Array.from(root.querySelectorAll("[data-kp-token]")).reverse()) token.replaceWith(...Array.from(token.childNodes));
     for (const element of root.querySelectorAll("[data-kp-line], [data-kp-rendered], [data-kp-autospace]")) {
       delete element.dataset.kpLine;
       delete element.dataset.kpRendered;
@@ -381,8 +430,9 @@
       const lineUnits = units.slice(line.start, line.end);
       const adjustments = distributeAdjustment(lineUnits, line);
       for (let index = line.start; index < line.end; index++) {
-        appendToken(lineEl, tokens[index], state, index + 1 === line.end);
-        appendAdjustment(state.leaf || lineEl, adjustments[index - line.start]);
+        const tokenEl = appendToken(lineEl, tokens[index], state);
+        const autoSpace = tokens[index].autoSpaceAfter && index + 1 < line.end ? (Number.parseFloat(getComputedStyle(el).fontSize) || 16) * 0.125 : 0;
+        applyTokenSpacing(tokenEl, adjustments[index - line.start], autoSpace);
       }
       if (line.flagged && tokens[line.end - 1]?.insert) {
         const hyphen = document.createElement("span");
@@ -399,6 +449,7 @@
       fragment.appendChild(lineEl);
     });
     muting = true;
+    if (settings.hangingPunctuation && result.lines.some(line => line.start_protrusion > 0 || line.end_protrusion > 0)) allowHangingOverflow(el);
     el.replaceChildren(fragment);
     el.style.textIndent = "0px";
     el.dataset.kpRendered = "1";

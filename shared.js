@@ -26,7 +26,8 @@
   const CLOSING = new Set(["，", "。", "、", "；", "：", "！", "？", "）", "］", "｝", "〕", "〉", "》", "」", "』", "】", "〗", "〙", "〛", "’", "”", "｠", "»", "›", "!", "?", ".", ",", ";", ":", "%", "‰", "°", ")", "]", "}", "\"", "'"]);
   const NON_STARTING = new Set([...CLOSING, "…", "—", "～", "~", "・", "·", "ゝ", "ゞ", "々", "ー", "ぁ", "ぃ", "ぅ", "ぇ", "ぉ", "っ", "ゃ", "ゅ", "ょ", "ゎ", "ァ", "ィ", "ゥ", "ェ", "ォ", "ッ", "ャ", "ュ", "ョ", "ヮ", "ヵ", "ヶ"]);
   const NON_ENDING = new Set([...OPENING, "￥", "$", "£", "€", "¥"]);
-  const HANGING_END = new Set(["，", "。", "、", "；", "：", "！", "？", ",", ".", ";", ":", "!", "?", "’", "”", "」", "』", "》", "〉", "）", ")", "]", "}"]);
+  const FULLWIDTH_HANGING_END = new Set(["，", "。", "、", "；", "：", "！", "？"]);
+  const HANGING_END = new Set([...FULLWIDTH_HANGING_END, ",", ".", ";", ":", "!", "?", "’", "”", "」", "』", "》", "〉", "）", ")", "]", "}"]);
   const HANGING_START = new Set([...OPENING]);
 
   function normalizeSettings(stored = {}) {
@@ -209,15 +210,40 @@
     };
   }
 
-  function punctuationProfile(token, em, enabled = true) {
+  function punctuationProfile(token, em, compressionEnabled = true, hangingEnabled = true) {
     const first = token?.text?.at(0);
     const last = token?.text?.at(-1);
-    if (!enabled || token?.type !== "punct") return { shrink: 0, startProtrusion: 0, endProtrusion: 0 };
+    if (token?.type !== "punct") return { shrink: 0, beforeShrink: 0, afterShrink: 0, startProtrusion: 0, endProtrusion: 0 };
+    const beforeShrink = compressionEnabled && CLOSING.has(last) ? em * (FULLWIDTH_HANGING_END.has(last) ? 0.5 : 0.25) : 0;
+    const afterShrink = compressionEnabled && OPENING.has(first) ? em * 0.25 : 0;
     return {
-      shrink: (OPENING.has(first) || CLOSING.has(last)) ? em * 0.25 : 0,
-      startProtrusion: HANGING_START.has(first) ? em * 0.5 : 0,
-      endProtrusion: HANGING_END.has(last) ? em * 0.5 : 0
+      shrink: beforeShrink + afterShrink,
+      beforeShrink,
+      afterShrink,
+      startProtrusion: hangingEnabled && HANGING_START.has(first) ? em * 0.5 : 0,
+      // A full-em protrusion can be completely clipped by common article
+      // containers using overflow:hidden. Half-em optical hanging keeps the
+      // punctuation visible while its compressed side bearing supplies the
+      // remaining capacity.
+      endProtrusion: hangingEnabled && HANGING_END.has(last) ? em * 0.5 : 0
     };
+  }
+
+  function tokenSpacingStyle(adjustment = 0, autoSpace = 0) {
+    const spacing = Number(adjustment) + Number(autoSpace);
+    if (!Number.isFinite(spacing) || Math.abs(spacing) < 0.01) return { paddingInlineEnd: 0, marginInlineEnd: 0 };
+    return spacing > 0
+      ? { paddingInlineEnd: spacing, marginInlineEnd: 0 }
+      : { paddingInlineEnd: 0, marginInlineEnd: spacing };
+  }
+
+  function shrinkCapacityForToken(token, width, em, maxShrink, punctuationShrink = 0) {
+    const spaceShrink = token?.type === "space" ? Math.max(width * maxShrink, em * 0.04) : 0;
+    return spaceShrink + Math.max(0, punctuationShrink);
+  }
+
+  function hangingBreakPenalty(penalty, endProtrusion, enabled = true) {
+    return Number(penalty) - (enabled && Number(endProtrusion) > 0 ? 50 : 0);
   }
 
   function distributeAdjustment(units, line) {
@@ -262,7 +288,7 @@
     }));
   }
 
-  const api = { DEFAULTS, OPENING, CLOSING, HANGING_START, HANGING_END, normalizeSettings, normalizeDomain, matchesDomain, effectiveEnabled, tokenizeText, applyBreakRules, hyphenateTokens, createPatternHyphenator, punctuationProfile, distributeAdjustment, needsAutoSpaceBetween, applySyntheticAutoSpacing };
+  const api = { DEFAULTS, OPENING, CLOSING, HANGING_START, HANGING_END, normalizeSettings, normalizeDomain, matchesDomain, effectiveEnabled, tokenizeText, applyBreakRules, hyphenateTokens, createPatternHyphenator, punctuationProfile, distributeAdjustment, tokenSpacingStyle, shrinkCapacityForToken, hangingBreakPenalty, needsAutoSpaceBetween, applySyntheticAutoSpacing };
   globalThis.TexLineBreakerShared = api;
   if (typeof module !== "undefined" && module.exports) module.exports = api;
 })();
