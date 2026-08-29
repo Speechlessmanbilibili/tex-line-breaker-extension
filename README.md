@@ -49,7 +49,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 ## 正式发行 ID
 
-从 v0.2.0 起清单固定公钥，v0.2.1 及后续正式发行 ID 为：
+从 v0.2.0 起清单固定公钥，v0.2.2 及后续正式发行 ID 为：
 
 ```text
 oicdbilhkpbjgbdbjklighpmkcbncfhp
