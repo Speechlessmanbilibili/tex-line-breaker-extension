@@ -257,7 +257,9 @@
   }
 
   function hangingBreakPenalty(penalty, endProtrusion, enabled = true) {
-    return Number(penalty) - (enabled && Number(endProtrusion) > 0 ? 180 : 0);
+    // This is only a tie-break preference. The WASM core further fades the
+    // bonus unless the line is already close to full with little stretching.
+    return Number(penalty) - (enabled && Number(endProtrusion) > 0 ? 12 : 0);
   }
 
   function distributeAdjustment(units, line) {

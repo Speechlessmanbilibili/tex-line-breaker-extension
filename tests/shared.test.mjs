@@ -115,7 +115,7 @@ test("ordinary CJK glyphs never expose shrink capacity", () => {
 });
 
 test("a legal hanging punctuation break receives priority", () => {
-  assert.equal(shared.hangingBreakPenalty(0, 8, true), -180);
+  assert.equal(shared.hangingBreakPenalty(0, 8, true), -12);
   assert.equal(shared.hangingBreakPenalty(0, 0, true), 0);
   assert.equal(shared.hangingBreakPenalty(25, 8, false), 25);
 });

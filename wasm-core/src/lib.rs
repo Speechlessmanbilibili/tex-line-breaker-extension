@@ -216,6 +216,29 @@ fn fitness(ratio: f64) -> usize {
     }
 }
 
+fn negative_penalty_bonus(metrics: &Metrics) -> f64 {
+    let base = metrics.penalty.abs().powi(2);
+    if metrics.end_protrusion <= 0.0 {
+        return base;
+    }
+
+    // Hanging punctuation is a preference only when the candidate line is
+    // already naturally close to the measure. Do not buy a hanging mark by
+    // stretching a short sentence across the remaining line width.
+    let fill = if metrics.target_width > 0.0 {
+        metrics.natural_width / metrics.target_width
+    } else {
+        0.0
+    };
+    let fill_scale = ((fill - 0.82) / 0.12).clamp(0.0, 1.0);
+    let stretch_scale = if metrics.ratio <= 0.10 {
+        1.0
+    } else {
+        ((0.45 - metrics.ratio) / 0.35).clamp(0.0, 1.0)
+    };
+    base * fill_scale.min(stretch_scale)
+}
+
 fn state_index(class: usize, flagged: bool) -> usize {
     class * 2 + usize::from(flagged)
 }
@@ -377,7 +400,7 @@ fn solve_pass(
                     if metrics.penalty >= 0.0 {
                         line_demerits += metrics.penalty.powi(2);
                     } else {
-                        line_demerits -= metrics.penalty.powi(2);
+                        line_demerits -= negative_penalty_bonus(&metrics);
                     }
                 }
                 if start > 0 && class.abs_diff(state_class(prior_state)) > 1 {
@@ -678,6 +701,49 @@ mod tests {
         punctuation.end_protrusion = 10.0;
         let output = solve(&input(vec![unit(80.0, false), punctuation], 90.0));
         assert!(!output.fallback);
+    }
+
+    #[test]
+    fn hanging_preference_does_not_reward_a_short_stretched_line() {
+        let mut first = unit(30.0, false);
+        first.stretch = 100.0;
+        let mut punctuation = unit(30.0, true);
+        punctuation.penalty = -180.0;
+        punctuation.end_protrusion = 10.0;
+        let mut data = input(
+            vec![first, punctuation, unit(30.0, true), unit(30.0, true)],
+            100.0,
+        );
+        data.fitness_demerits = 0.0;
+        data.short_last_line_penalty = 0.0;
+        data.orphan_penalty = 0.0;
+        let output = solve(&data);
+        assert_eq!(output.lines[0].end, 3);
+    }
+
+    #[test]
+    fn hanging_preference_fades_with_fill_and_stretch() {
+        let mut near = Metrics {
+            ratio: 0.1,
+            badness: 0.0,
+            penalty: -12.0,
+            adjustment: 0.0,
+            emergency: 0.0,
+            start_protrusion: 0.0,
+            end_protrusion: 8.0,
+            insert_width: 0.0,
+            flagged: false,
+            forced: false,
+            visible_units: 8,
+            natural_width: 95.0,
+            target_width: 100.0,
+        };
+        assert_eq!(negative_penalty_bonus(&near), 144.0);
+        near.natural_width = 75.0;
+        assert_eq!(negative_penalty_bonus(&near), 0.0);
+        near.natural_width = 95.0;
+        near.ratio = 0.5;
+        assert_eq!(negative_penalty_bonus(&near), 0.0);
     }
 
     #[test]
